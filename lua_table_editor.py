@@ -9,6 +9,7 @@ import sys
 import os
 import re
 import json
+from functools import lru_cache
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -25,7 +26,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel,
     Signal, Slot, QSize, QRect, QPoint, QEvent, QTimer, QSettings,
-    QUrl, QMimeData
+    QUrl, QMimeData, QThread, QObject
 )
 from PySide6.QtGui import (
     QAction, QKeySequence, QColor, QFont, QBrush, QPainter,
@@ -65,6 +66,8 @@ class LuaTableData:
     decl_raw: str = ""        # 表声明行原文（如 "local X = {" 或 "return {"），逐字保留
     close_raw: str = ""       # 表体结束的 "}" 行原文（含缩进/尾随注释），逐字保留
     footer_raw: list = field(default_factory=list)  # "}" 之后到文件末尾的所有行（return、尾注释等），逐字保留
+    # ---- 磁盘文件元信息（用于自动刷新判断）----
+    file_mtime: float = 0.0   # 最近一次从磁盘读取/写入时的文件修改时间
 
 
 # ============================================================================
@@ -352,8 +355,10 @@ class LuaParser:
                 all_fields_set.add(f)
 
     @staticmethod
+    @lru_cache(maxsize=8192)
     def _extract_fields(line: str) -> list:
-        """从一行数据中提取所有字段名，保持出现顺序"""
+        """从一行数据中提取所有字段名，保持出现顺序。
+        用 lru_cache 缓存：parse 中同一行会被分类与字段排序两次调用，命中缓存可省一半开销。"""
         fields_dict = {}  # 使用 dict 实现 O(1) 去重，保持 Python 3.7+ 插入顺序
         content = LuaParser._get_brace_content(line)
         if not content:
@@ -3163,6 +3168,35 @@ class AboutDialog(QDialog):
         close_btn.clicked.connect(self.close)
         layout.addWidget(close_btn, alignment=Qt.AlignCenter)
 
+# ============================================================================
+# 后台加载线程：把文件读取 + 解析放到子线程，避免大表解析阻塞 UI 主线程
+# ============================================================================
+class _LoadSignals(QObject):
+    finished = Signal(object, str)   # (LuaTableData, file_path)
+    error = Signal(str)               # error_message
+
+
+class LuaLoadWorker(QThread):
+    """在子线程中读取并解析 Lua 文件，完成后通过信号把结果抛回主线程。"""
+
+    def __init__(self, file_path: str):
+        super().__init__()
+        self._file_path = file_path
+        self.signals = _LoadSignals()
+
+    def run(self):
+        try:
+            with open(self._file_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+            data = LuaParser.parse(text)
+            data.file_path = self._file_path
+            data.modified = False
+            data.file_mtime = os.path.getmtime(self._file_path)
+            self.signals.finished.emit(data, self._file_path)
+        except Exception as e:  # 解析/读取异常统一回传
+            self.signals.error.emit(str(e))
+
+
 class MainWindow(QMainWindow):
     """Lua Table Editor 主窗口"""
 
@@ -3175,8 +3209,16 @@ class MainWindow(QMainWindow):
         self._tabs_data: dict = {}
         self._find_dialog: Optional[FindDialog] = None
         self._untitled_counter = 1
-        self._loading = False  # 防止重复加载请求
+        self._loading = False  # 防止重复加载请求（手动打开/刷新）
+        self._workers: list = []  # 后台加载线程引用，避免被提前回收
         self._context_row = -1  # 右键所在行（用于复制/粘贴整行）
+
+        # 定时自动刷新：对“未修改且磁盘已变更”的已打开表静默重载
+        self._auto_refresh_enabled = True
+        self._auto_refresh_timer = QTimer(self)
+        self._auto_refresh_timer.setInterval(30000)  # 30 秒
+        self._auto_refresh_timer.timeout.connect(self._auto_refresh_all)
+        self._auto_refresh_timer.start()
 
         # 最近文件
         self._settings = QSettings("LuaTableEditor", "LuaTableEditor")
@@ -3244,6 +3286,12 @@ class MainWindow(QMainWindow):
         view_menu = menubar.addMenu("查看(&V)")
         self._act_toggle_workspace = self._add_action(view_menu, "工作区面板(&W)", "Ctrl+B", self._toggle_workspace)
         self._act_toggle_detail = self._add_action(view_menu, "详情栏(&D)", "Ctrl+D", self._toggle_detail)
+        view_menu.addSeparator()
+        self._act_auto_refresh = QAction("自动刷新打开的表(&A)", self)
+        self._act_auto_refresh.setCheckable(True)
+        self._act_auto_refresh.setChecked(self._auto_refresh_enabled)
+        self._act_auto_refresh.triggered.connect(self._toggle_auto_refresh)
+        view_menu.addAction(self._act_auto_refresh)
 
         # 查找菜单
         find_menu = menubar.addMenu("查找(&S)")
@@ -3262,6 +3310,14 @@ class MainWindow(QMainWindow):
         act.triggered.connect(slot)
         menu.addAction(act)
         return act
+
+    def _toggle_auto_refresh(self, checked: bool):
+        """切换定时自动刷新开关"""
+        self._auto_refresh_enabled = checked
+        if checked:
+            # 立即检查一次，避免开启后还要等一个周期
+            self._auto_refresh_all()
+        self._status_label.setText(f"自动刷新已{'开启' if checked else '关闭'}")
 
     # ---- 工具栏 ----
     def _setup_toolbar(self):
@@ -3830,12 +3886,7 @@ class MainWindow(QMainWindow):
         self._open_file_path(file_path)
 
     def _open_file_path(self, file_path: str):
-        """打开指定路径的文件"""
-        # 防止重复加载请求
-        if self._loading:
-            self._status_label.setText("正在加载中，请稍候...")
-            return
-
+        """打开指定路径的文件（后台线程解析，UI 不再卡顿）"""
         # 检查文件是否已打开（加载前检查可快速返回，无需进度条）
         for tab_id, td in self._tabs_data.items():
             if td['data'].file_path == file_path:
@@ -3845,47 +3896,91 @@ class MainWindow(QMainWindow):
                         self._status_label.setText(f"已切换到: {file_path}")
                         return
 
-        self._loading = True
-        self._loading_progress.show()
-        self._status_label.setText(f"正在加载: {os.path.basename(file_path)}...")
-        QApplication.processEvents()  # 确保进度条立刻渲染
+        # 防止重复加载请求（手动加载期间不重复触发）
+        if self._loading:
+            self._status_label.setText("正在加载中，请稍候...")
+            return
 
-        try:
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    text = f.read()
-            except Exception as e:
-                QMessageBox.critical(self, "错误", f"无法读取文件:\n{e}")
+        self._start_load(file_path, lambda data, fp: self._finalize_open(data, fp))
+
+    def _finalize_open(self, data: LuaTableData, file_path: str):
+        """后台加载完成后创建标签页并收尾（主线程执行）"""
+        # 若加载期间该文件已被打开（例如重复点击），直接切换
+        for tab_id, td in self._tabs_data.items():
+            if td['data'].file_path == file_path:
+                for i in range(self._tab_widget.count()):
+                    if self._tab_widget.widget(i) == td['tab']:
+                        self._tab_widget.setCurrentIndex(i)
+                        self._status_label.setText(f"已切换到: {file_path}")
+                        return
+
+        title = os.path.basename(file_path)
+
+        # 检测文件所属工作区
+        ws_folder = self._workspace_panel.get_workspace_for_file(file_path)
+        ws_color = None
+        if ws_folder:
+            ws_color = self._workspace_panel.get_workspace_color(ws_folder)
+
+        tab = self._create_tab(data, title, workspace_color=ws_color)
+        td = self._tabs_data.get(id(tab))
+        if td and ws_folder:
+            td['workspace_folder'] = ws_folder
+        if td:
+            td['file_path'] = file_path
+            self._update_tab_path_label(td)
+
+        self._add_recent_file(file_path)
+        self._update_statusbar()
+        self._status_label.setText(f"已打开: {file_path}")
+
+    # ---- 后台加载编排 ----
+    def _start_load(self, file_path: str, on_loaded, show_progress=True, auto=False):
+        """在后台线程加载文件。
+
+        on_loaded(data, file_path) 在加载完成后于主线程调用。
+        show_progress=True 时显示进度条并设置全局 _loading 锁（用于用户主动打开/刷新）；
+        auto=True 时不弹进度条、不设全局锁（用于静默的定时自动刷新）。
+        """
+        if show_progress:
+            if self._loading:
+                self._status_label.setText("正在加载中，请稍候...")
                 return
+            self._loading = True
+            self._loading_progress.show()
+            self._status_label.setText(f"正在加载: {os.path.basename(file_path)}...")
+            QApplication.processEvents()  # 让进度条先渲染出来
 
-            data = LuaParser.parse(text)
-            data.file_path = file_path
-            data.modified = False
-            title = os.path.basename(file_path)
+        worker = LuaLoadWorker(file_path)
+        self._workers.append(worker)  # 保持引用，避免被回收
+        worker.signals.finished.connect(
+            lambda d, fp, cb=on_loaded, sp=show_progress:
+                self._on_load_finished(d, fp, cb, sp))
+        worker.signals.error.connect(
+            lambda msg, sp=show_progress, a=auto: self._on_load_error(msg, sp, a))
+        worker.finished.connect(lambda w=worker: self._on_worker_done(w))
+        worker.start()
 
-            # 检测文件所属工作区
-            ws_folder = self._workspace_panel.get_workspace_for_file(file_path)
-            ws_color = None
-            if ws_folder:
-                ws_color = self._workspace_panel.get_workspace_color(ws_folder)
-
-            tab = self._create_tab(data, title, workspace_color=ws_color)
-            # 更新工作区文件夹信息
-            td = self._tabs_data.get(id(tab))
-            if td and ws_folder:
-                td['workspace_folder'] = ws_folder
-
-            # 设置标签页路径显示和提示
-            if td:
-                td['file_path'] = file_path
-                self._update_tab_path_label(td)
-
-            self._add_recent_file(file_path)
-            self._update_statusbar()
-            self._status_label.setText(f"已打开: {file_path}")
+    def _on_load_finished(self, data, file_path, on_loaded, show_progress):
+        try:
+            on_loaded(data, file_path)
         finally:
+            if show_progress:
+                self._loading_progress.hide()
+                self._loading = False
+
+    def _on_load_error(self, msg, show_progress, auto):
+        if show_progress:
             self._loading_progress.hide()
             self._loading = False
+        if auto:
+            self._status_label.setText(f"自动刷新失败: {msg}")
+        else:
+            QMessageBox.critical(self, "加载失败", f"无法加载文件:\n{msg}")
+
+    def _on_worker_done(self, worker):
+        if worker in self._workers:
+            self._workers.remove(worker)
 
     def _save_file(self):
         """保存当前文件"""
@@ -3928,6 +4023,7 @@ class MainWindow(QMainWindow):
             data._raw_text = text
             data.file_path = file_path
             data.modified = False
+            data.file_mtime = os.path.getmtime(file_path)  # 更新 mtime，避免被自动刷新误判为变更
             td = self._get_current_tab_data()
             td['title'] = os.path.basename(file_path)
             td['file_path'] = file_path
@@ -3938,7 +4034,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "错误", f"保存失败:\n{e}")
 
     def _refresh_file(self):
-        """刷新当前文件，从磁盘重新读取"""
+        """刷新当前文件，从磁盘重新读取（后台线程）"""
         td = self._get_current_tab_data()
         if not td:
             return
@@ -3968,31 +4064,26 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.Yes:
                 return
 
-        self._loading = True
-        self._loading_progress.show()
-        self._status_label.setText(f"正在刷新: {os.path.basename(data.file_path)}...")
-        QApplication.processEvents()
+        self._reload_tab(td, show_status=True)
 
-        try:
-            try:
-                with open(data.file_path, 'r', encoding='utf-8') as f:
-                    text = f.read()
-            except Exception as e:
-                QMessageBox.critical(self, "错误", f"无法读取文件:\n{e}")
+    def _reload_tab(self, td, show_status=False, auto=False):
+        """后台重新解析某标签页对应的磁盘文件并更新模型。"""
+        data = td['data']
+        fp = data.file_path
+        if not fp or not os.path.exists(fp):
+            return
+
+        def on_loaded(new_data, file_path):
+            # 重新校验：若加载期间该表被改成已修改，放弃覆盖以免丢失编辑
+            if data.modified:
                 return
-
-            # 重新解析
-            new_data = LuaParser.parse(text)
-            new_data.file_path = data.file_path
-            new_data.modified = False
-
-            # 更新模型
             model = td['model']
+            new_data.modified = False
             model.set_data(new_data)
 
             # 更新存储的数据引用
             td['data'] = new_data
-            td['title'] = os.path.basename(data.file_path)
+            td['title'] = os.path.basename(file_path)
 
             # 清除筛选
             proxy = td['proxy']
@@ -4006,10 +4097,30 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(50, lambda: self._auto_resize_columns(td['view']))
 
             self._update_statusbar()
-            self._status_label.setText(f"已刷新: {data.file_path}")
-        finally:
-            self._loading_progress.hide()
-            self._loading = False
+            if show_status:
+                self._status_label.setText(f"已刷新: {file_path}")
+
+        self._start_load(fp, on_loaded, show_progress=not auto, auto=auto)
+
+    def _auto_refresh_all(self):
+        """定时自动刷新：仅刷新“未修改且磁盘文件已变更”的已打开标签页。"""
+        if not self._auto_refresh_enabled:
+            return
+        # 用户主动加载/刷新进行中时，本 tick 跳过，避免互相干扰
+        if self._loading:
+            return
+        for td in list(self._tabs_data.values()):
+            data = td['data']
+            fp = data.file_path
+            if not fp or data.modified or not os.path.exists(fp):
+                continue
+            try:
+                mtime = os.path.getmtime(fp)
+            except OSError:
+                continue
+            # 文件比上次读取/保存更新 -> 重新加载（静默，不弹进度条）
+            if mtime > data.file_mtime + 1e-6:
+                self._reload_tab(td, auto=True)
 
     def _close_tab(self):
         """关闭当前标签页"""
@@ -4639,6 +4750,65 @@ class MainWindow(QMainWindow):
                                     "请保存文件以保留更改。")
         else:
             QMessageBox.information(self, "无需修复", "所有数据行都已有行键，无需修复。")
+
+    # ---- 批量同步选中行的行键（与 id 一致）----
+    def _batch_sync_row_keys(self):
+        """将选中的多行数据行的行键同步成各自的 id 值（覆盖式同步）"""
+        view = self._get_view()
+        model = self._get_model()
+        data = self._get_data()
+        proxy = self._get_proxy()
+        if not (view and model and data):
+            return
+
+        if 'id' not in data.field_names:
+            QMessageBox.information(self, "无法同步", "当前表没有 'id' 字段，无法同步行键。")
+            return
+
+        sel_indexes = view.selectionModel().selectedIndexes()
+        if not sel_indexes:
+            QMessageBox.information(self, "提示",
+                                    "请先选中要同步的行（按住 Ctrl/Shift 可多选）。")
+            return
+
+        # 通过 model._resolve_row 映射到 data.rows 的真实下标，并去重
+        target_idx = set()
+        for idx in sel_indexes:
+            src_idx = proxy.mapToSource(idx) if proxy else idx
+            rt, real_idx = model._resolve_row(src_idx.row())
+            if rt == model.ROW_DATA and 0 <= real_idx < len(data.rows):
+                target_idx.add(real_idx)
+
+        if not target_idx:
+            QMessageBox.information(self, "提示", "选中的行中没有数据行。")
+            return
+
+        synced = 0
+        skipped = 0
+        for i in target_idx:
+            row_entry = data.rows[i]
+            rid = row_entry.data.get('id')
+            if rid is None or rid == '':
+                skipped += 1
+                continue
+            row_entry.row_key = str(rid)
+            row_entry._dirty = True
+            synced += 1
+
+        if synced == 0:
+            QMessageBox.information(self, "提示",
+                                    "没有可同步的行（所选数据行均缺少 id 字段）。")
+            return
+
+        data.modified = True
+        model._rebuild_duplicates()
+        model.safe_notify_reset()
+        self._update_tab_title()
+        self._update_statusbar()
+        msg = f"已同步 {synced} 行的行键与 id"
+        if skipped:
+            msg += f"（{skipped} 行缺少 id 已跳过）"
+        self._status_label.setText(msg)
 
     # ---- 修改 / 设置行键（右键菜单）----
     def _resolve_context_data(self):
@@ -5272,6 +5442,8 @@ class MainWindow(QMainWindow):
         edit_key_act.setEnabled(has_context_row)
         set_key_from_id_act = menu.addAction("🆔 从 id 获得本行行键")
         set_key_from_id_act.setEnabled(has_context_row)
+        sync_keys_act = menu.addAction("🆔 批量同步选中行键 (与 id 一致)")
+        sync_keys_act.setEnabled(has_data_rows)
 
         action = menu.exec(view.viewport().mapToGlobal(pos))
 
@@ -5299,6 +5471,8 @@ class MainWindow(QMainWindow):
             self._edit_row_key()
         elif action == set_key_from_id_act:
             self._set_row_key_from_id()
+        elif action == sync_keys_act:
+            self._batch_sync_row_keys()
 
     def _check_selected_row_types(self) -> tuple:
         """检查当前选中行的类型，返回 (has_data_rows, has_comment_rows)"""
