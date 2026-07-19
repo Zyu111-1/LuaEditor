@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts (PyInstaller)
+build/
+dist/
+*.spec
+
+# Temp / test files
+_test_*.py
+_test_out.txt
+*.tmp
+
+# Editor / OS
+.codebuddy/
+.vscode/
+.DS_Store
