@@ -1455,8 +1455,23 @@ class LuaTableDelegate(QStyledItemDelegate):
             is_hl_row = (row == hl_row) and hl_row >= 0
             is_highlighted = is_hl_row and not is_selected
 
-            # 背景色：根据行类型区分
-            if is_selected:
+            # 整行 / 整列 / 交叉点 选中高亮
+            sel_row = sel_col = False
+            if view is not None:
+                sm = view.selectionModel()
+                if sm is not None and index.isValid():
+                    sel_row = sm.isRowSelected(index.row(), QModelIndex())
+                    sel_col = sm.isColumnSelected(index.column(), QModelIndex())
+            is_intersect = sel_row and sel_col
+
+            # 背景色：根据行类型区分，叠加选中行/列高亮
+            if is_intersect:
+                painter.fillRect(option.rect, QColor('#ffd24d'))   # 交叉点：金色强调
+            elif sel_row:
+                painter.fillRect(option.rect, QColor('#bfe3ff'))   # 整行选中：蓝
+            elif sel_col:
+                painter.fillRect(option.rect, QColor('#ffd9b3'))   # 整列选中：橙
+            elif is_selected:
                 painter.fillRect(option.rect, QColor('#3a4a5a'))
             elif is_highlighted:
                 painter.fillRect(option.rect, QColor('#d8dfeb'))
@@ -1521,9 +1536,26 @@ class LuaTableDelegate(QStyledItemDelegate):
         is_highlighted = (is_hl_row or is_hl_col) and not is_selected and col > 0
         is_dup = not is_selected and col > 0 and src.is_duplicate(row, col)
 
+        # 整行 / 整列 / 交叉点 选中高亮
+        sel_row = sel_col = False
+        if view is not None:
+            sm = view.selectionModel()
+            if sm is not None and index.isValid():
+                sel_row = sm.isRowSelected(index.row(), QModelIndex())
+                sel_col = sm.isColumnSelected(index.column(), QModelIndex())
+        is_intersect = sel_row and sel_col
+        is_sel_row = sel_row and not is_intersect
+        is_sel_col = sel_col and not is_intersect
+
         # ---- 背景色 ----
-        if is_selected:
-            painter.fillRect(option.rect, QColor('#a8d4f0'))
+        if is_intersect:
+            painter.fillRect(option.rect, QColor('#ffd24d'))   # 交叉点：金色强强调
+        elif is_sel_row:
+            painter.fillRect(option.rect, QColor('#bfe3ff'))   # 整行选中：蓝
+        elif is_sel_col:
+            painter.fillRect(option.rect, QColor('#ffd9b3'))   # 整列选中：橙
+        elif is_selected:
+            painter.fillRect(option.rect, QColor('#a8d4f0'))   # 普通块选中：浅蓝
         elif is_dup:
             painter.fillRect(option.rect, QColor('#ffe8e0'))
         elif is_highlighted:
@@ -1571,6 +1603,13 @@ class LuaTableDelegate(QStyledItemDelegate):
         else:
             # 行号
             super().paint(painter, option, index)
+
+        # 交叉点（整行且整列同时选中）单元格边框强调
+        if col > 0 and is_intersect:
+            painter.save()
+            painter.setPen(QPen(QColor('#e69500'), 2))
+            painter.drawRect(option.rect.adjusted(1, 1, -1, -1))
+            painter.restore()
 
         painter.restore()
 
@@ -1767,6 +1806,7 @@ class LuaTableView(QTableView):
     fill_completed = Signal()  # 填充完成信号
     copy_requested = Signal()  # Ctrl+C 复制信号
     paste_requested = Signal()  # Ctrl+V 粘贴信号
+    header_context_menu_requested = Signal(object, QPoint)  # (header, pos) 供冻结列菜单
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1779,6 +1819,12 @@ class LuaTableView(QTableView):
         # 当前焦点格的行/列高亮跟踪（源模型坐标）
         self._highlight_row = -1
         self._highlight_col = -1
+
+        # ---- 列固定（冻结）状态 ----
+        self._frozen = []          # [{'col': int, 'side': 'left'/'right'}]
+        self._frozen_views = []    # 对应的 overlay QTableView
+        self._syncing = False      # 垂直滚动同步防递归
+        self.verticalScrollBar().valueChanged.connect(self._on_main_vscroll)
 
         self.viewport().setMouseTracking(True)
         self.viewport().installEventFilter(self)
@@ -1877,8 +1923,139 @@ class LuaTableView(QTableView):
             self.FILL_SIZE, self.FILL_SIZE
         )
 
+    # ---- 列固定（冻结）功能 ----
+    def is_column_frozen(self, col: int) -> bool:
+        return any(e['col'] == col for e in self._frozen)
+
+    def has_frozen_columns(self) -> bool:
+        return len(self._frozen) > 0
+
+    def freeze_column(self, col: int, side: str = 'left'):
+        """固定某列到左侧或右侧（支持复数、非连续列；重复固定先移除旧的）"""
+        if col <= 0:
+            return
+        self._frozen = [e for e in self._frozen if e['col'] != col]
+        self._frozen.append({'col': col, 'side': side})
+        self._rebuild_frozen()
+
+    def unfreeze_column(self, col: int):
+        self._frozen = [e for e in self._frozen if e['col'] != col]
+        self._rebuild_frozen()
+
+    def unfreeze_all(self):
+        self._frozen = []
+        self._rebuild_frozen()
+
+    def _rebuild_frozen(self):
+        """销毁旧 overlay 并按当前 _frozen 重建（主视图隐藏冻结列）"""
+        for ov in self._frozen_views:
+            ov.deleteLater()
+        self._frozen_views = []
+
+        model = self.model()
+        # 先恢复所有列可见，再隐藏冻结列
+        if model is not None:
+            for c in range(model.columnCount()):
+                self.setColumnHidden(c, False)
+            for e in self._frozen:
+                self.setColumnHidden(e['col'], True)
+
+        if model is None:
+            return
+
+        for e in self._frozen:
+            ov = QTableView(self)
+            ov._frozen_col = e['col']
+            ov._side = e['side']
+            ov.setModel(model)
+            ov.setSelectionModel(self.selectionModel())
+            ov.setItemDelegate(self.itemDelegate())
+            ov.horizontalHeader().setVisible(True)
+            ov.verticalHeader().setVisible(False)
+            ov.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            ov.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            ov.setSelectionBehavior(self.selectionBehavior())
+            ov.setSelectionMode(self.selectionMode())
+            ov.setEditTriggers(self.editTriggers())
+            ov.setShowGrid(self.showGrid())
+            ov.verticalHeader().setDefaultSectionSize(
+                self.verticalHeader().defaultSectionSize())
+            border = ("border-right: 2px solid #b0b8c0;"
+                      if e['side'] == 'left' else "border-left: 2px solid #b0b8c0;")
+            ov.setStyleSheet(f"QTableView {{ border: none; background: #ffffff; {border} }}")
+            for c in range(model.columnCount()):
+                ov.setColumnHidden(c, c != e['col'])
+            ov.setColumnWidth(e['col'], self.columnWidth(e['col']))
+            # 垂直滚动同步（双向，带防递归）
+            ov.verticalScrollBar().valueChanged.connect(
+                lambda v, o=ov: self._sync_vscroll(v, o))
+            # overlay 中改列宽 -> 同步回主视图并重排
+            ov.horizontalHeader().sectionResized.connect(
+                lambda idx, old, new, ov=ov, fc=e['col']:
+                    (self.setColumnWidth(fc, new), ov.setColumnWidth(fc, new),
+                     self._layout_frozen()))
+            ov.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
+            ov.horizontalHeader().customContextMenuRequested.connect(
+                lambda pos, h=ov.horizontalHeader(): self._emit_header_menu(h, pos))
+            ov.verticalScrollBar().setValue(self.verticalScrollBar().value())
+            ov.installEventFilter(self)
+            ov.raise_()
+            self._frozen_views.append(ov)
+
+        self._layout_frozen()
+        self.viewport().update()
+
+    def _emit_header_menu(self, header, pos):
+        self.header_context_menu_requested.emit(header, pos)
+
+    def _layout_frozen(self):
+        """根据冻结列顺序与列宽，定位各个 overlay（左/右两侧）"""
+        if not self._frozen_views:
+            return
+        vhw = self.verticalHeader().width()
+        vscroll_w = self.verticalScrollBar().width() if self.verticalScrollBar().isVisible() else 0
+        hscroll_h = self.horizontalScrollBar().height() if self.horizontalScrollBar().isVisible() else 0
+        total_h = self.height() - hscroll_h
+        left_x = vhw
+        right_x_end = self.width() - vscroll_w
+        for e, ov in zip(self._frozen, self._frozen_views):
+            w = self.columnWidth(e['col'])
+            if e['side'] == 'left':
+                ov.setGeometry(left_x, 0, w, total_h)
+                left_x += w
+            else:
+                right_x_end -= w
+                ov.setGeometry(right_x_end, 0, w, total_h)
+
+    def _on_main_vscroll(self, value):
+        self._sync_vscroll(value, self)
+
+    def _sync_vscroll(self, value, src):
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            self.verticalScrollBar().setValue(value)
+            for ov in self._frozen_views:
+                if ov is not src:
+                    ov.verticalScrollBar().setValue(value)
+        finally:
+            self._syncing = False
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._layout_frozen()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._layout_frozen()
+
     # ---- 事件过滤器：拦截视口鼠标事件 ----
     def eventFilter(self, obj, event):
+        # 冻结列 overlay：转发滚轮到主视图，保持滚动一致
+        if obj in getattr(self, '_frozen_views', []) and event.type() == QEvent.Wheel:
+            QApplication.sendEvent(self.viewport(), event)
+            return True
         if obj != self.viewport():
             return super().eventFilter(obj, event)
 
@@ -3620,7 +3797,10 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(QHeaderView.Interactive)
         header.sectionClicked.connect(self._on_header_clicked)
         header.setContextMenuPolicy(Qt.CustomContextMenu)
-        header.customContextMenuRequested.connect(self._on_header_context_menu)
+        header.customContextMenuRequested.connect(
+            lambda pos: self._on_header_context_menu(header, pos))
+        # overlay 表头（冻结列）的右键菜单也走同一处理函数
+        table_view.header_context_menu_requested.connect(self._on_header_context_menu)
 
         # 模型和代理
         model = LuaTableModel()
@@ -5307,12 +5487,11 @@ class MainWindow(QMainWindow):
         """点击列头"""
         pass  # 保留以备扩展
 
-    def _on_header_context_menu(self, pos: QPoint):
-        """表头右键菜单 - 列筛选"""
-        header = self.sender()
+    def _on_header_context_menu(self, header, pos: QPoint):
+        """表头右键菜单 - 列固定 + 列筛选"""
         section = header.logicalIndexAt(pos)
 
-        # 行号列不筛选
+        # 行号列不固定/不筛选
         if section <= 0:
             return
 
@@ -5323,6 +5502,22 @@ class MainWindow(QMainWindow):
 
         menu = QMenu(self)
         menu.setStyleSheet("QMenu { font-size: 13px; }")
+
+        # ---- 列固定（冻结）选项 ----
+        if view.is_column_frozen(section):
+            act_u = menu.addAction("❌ 取消固定此列")
+            act_u.triggered.connect(lambda: view.unfreeze_column(section))
+        else:
+            act_l = menu.addAction("📌 固定此列到左侧")
+            act_l.triggered.connect(lambda: view.freeze_column(section, 'left'))
+            act_r = menu.addAction("📌 固定此列到右侧")
+            act_r.triggered.connect(lambda: view.freeze_column(section, 'right'))
+        if view.has_frozen_columns():
+            menu.addSeparator()
+            act_all = menu.addAction("❌ 取消所有固定列")
+            act_all.triggered.connect(lambda: view.unfreeze_all())
+
+        menu.addSeparator()
 
         # 清除筛选
         clear_act = menu.addAction("清除筛选")
