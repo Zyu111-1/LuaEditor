@@ -1543,7 +1543,10 @@ class LuaTableDelegate(QStyledItemDelegate):
         sel_row = sel_col = False
         if view is not None:
             sm = view.selectionModel()
-            if sm is not None and index.isValid():
+            # 无选区时跳过逐格选择态查询：isRowSelected/isColumnSelected 是 O(选中范围)
+            # 的查询，大表无选中时被每个单元格各调用一次会明显拖慢；尤其多个冻结列
+            # 浮层共享同一选择模型时该开销成倍放大。普通块选中高亮仍由 option.state 提供。
+            if sm is not None and sm.hasSelection() and index.isValid():
                 sel_row = sm.isRowSelected(index.row(), QModelIndex())
                 sel_col = sm.isColumnSelected(index.column(), QModelIndex())
         is_intersect = sel_row and sel_col
@@ -1825,7 +1828,8 @@ class LuaTableView(QTableView):
 
         # ---- 列固定（冻结）状态 ----
         self._frozen = []          # [{'col': int, 'side': 'left'/'right'}]
-        self._frozen_views = []    # 对应的 overlay QTableView
+        # 每侧最多一个 overlay QTableView（合并该侧所有冻结列，避免多开视图拖慢）
+        self._frozen_views = {'left': None, 'right': None}
         self._syncing = False      # 垂直滚动同步防递归
         self.verticalScrollBar().valueChanged.connect(self._on_main_vscroll)
 
@@ -1962,10 +1966,16 @@ class LuaTableView(QTableView):
         self._rebuild_frozen()
 
     def _rebuild_frozen(self):
-        """销毁旧 overlay 并按当前 _frozen 重建（主视图隐藏冻结列）"""
-        for ov in self._frozen_views:
-            ov.deleteLater()
-        self._frozen_views = []
+        """销毁旧 overlay 并按当前 _frozen 重建。
+
+        性能优化：每侧（left/right）只用一个 QTableView 浮层合并显示该侧所有
+        冻结列（隐藏其余列），而非每列一个浮层。这样每帧最多重绘 2 个浮层 +
+        主视图，避免“冻结列数”放大重绘开销（原来每冻结一列就多开一个完整视图）。
+        """
+        for ov in self._frozen_views.values():
+            if ov is not None:
+                ov.deleteLater()
+        self._frozen_views = {'left': None, 'right': None}
 
         model = self.model()
         # 先恢复所有列可见，再隐藏冻结列
@@ -1978,10 +1988,15 @@ class LuaTableView(QTableView):
         if model is None:
             return
 
-        for e in self._frozen:
+        # 每侧创建一个合并浮层
+        for side in ('left', 'right'):
+            cols = [e for e in self._frozen if e['side'] == side]
+            if not cols:
+                continue
+            cols.sort(key=lambda e: e['col'])  # 冻结列按列号顺序紧挨显示
+
             ov = QTableView(self)
-            ov._frozen_col = e['col']
-            ov._side = e['side']
+            ov._side = side
             ov.setModel(model)
             ov.setSelectionModel(self.selectionModel())
             ov.setItemDelegate(self.itemDelegate())
@@ -1996,20 +2011,23 @@ class LuaTableView(QTableView):
             ov.verticalHeader().setDefaultSectionSize(
                 self.verticalHeader().defaultSectionSize())
             border = ("border-right: 2px solid #b0b8c0;"
-                      if e['side'] == 'left' else "border-left: 2px solid #b0b8c0;")
+                      if side == 'left' else "border-left: 2px solid #b0b8c0;")
             ov.setStyleSheet(f"QTableView {{ border: none; background: #ffffff; {border} }}")
+
+            # 隐藏所有非本侧冻结列（冻结列按列号顺序自动紧挨显示）
+            frozen_cols = {e['col'] for e in cols}
             for c in range(model.columnCount()):
-                ov.setColumnHidden(c, c != e['col'])
-            fw = self._frozen_width(e)
-            ov.setColumnWidth(e['col'], fw)
+                ov.setColumnHidden(c, c not in frozen_cols)
+            # 设置各冻结列宽度
+            for e in cols:
+                ov.setColumnWidth(e['col'], self._frozen_width(e))
+
             # 垂直滚动同步（双向，带防递归）
             ov.verticalScrollBar().valueChanged.connect(
                 lambda v, o=ov: self._sync_vscroll(v, o))
-            # overlay 中改列宽 -> 同步回主视图并重排
+            # 浮层中改列宽 -> 同步回主视图并重排浮层
             ov.horizontalHeader().sectionResized.connect(
-                lambda idx, old, new, ov=ov, fc=e['col'], e=e:
-                    (e.__setitem__('width', new), self.setColumnWidth(fc, new),
-                     ov.setColumnWidth(fc, new), self._layout_frozen()))
+                lambda idx, old, new, ov=ov: self._on_frozen_section_resized(ov, idx, new))
             ov.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
             ov.horizontalHeader().customContextMenuRequested.connect(
                 lambda pos, h=ov.horizontalHeader(): self._emit_header_menu(h, pos))
@@ -2020,7 +2038,7 @@ class LuaTableView(QTableView):
             # 必须显式 show()，否则它保持隐藏 -> 主视图隐藏了该列而 overlay 不可见，
             # 表现就是“被固定的列直接消失”。
             ov.show()
-            self._frozen_views.append(ov)
+            self._frozen_views[side] = ov
 
         self._layout_frozen()
         self.viewport().update()
@@ -2028,24 +2046,35 @@ class LuaTableView(QTableView):
     def _emit_header_menu(self, header, pos):
         self.header_context_menu_requested.emit(header, pos)
 
+    def _frozen_side_width(self, side: str) -> int:
+        """该侧所有冻结列宽度之和（即该侧浮层的整体宽度）"""
+        return sum(self._frozen_width(e) for e in self._frozen if e['side'] == side)
+
+    def _on_frozen_section_resized(self, ov, idx: int, new: int):
+        """浮层内调整某冻结列宽度 -> 同步回主视图并重排浮层宽度"""
+        for e in self._frozen:
+            if e['col'] == idx:
+                e['width'] = new
+                self.setColumnWidth(idx, new)
+                ov.setColumnWidth(idx, new)
+                break
+        self._layout_frozen()
+
     def _layout_frozen(self):
-        """根据冻结列顺序与列宽，定位各个 overlay（左/右两侧）"""
-        if not self._frozen_views:
+        """定位左右两个合并浮层（每侧一个整体控件）"""
+        if not any(v is not None for v in self._frozen_views.values()):
             return
         vhw = self.verticalHeader().width()
         vscroll_w = self.verticalScrollBar().width() if self.verticalScrollBar().isVisible() else 0
         hscroll_h = self.horizontalScrollBar().height() if self.horizontalScrollBar().isVisible() else 0
         total_h = self.height() - hscroll_h
-        left_x = vhw
-        right_x_end = self.width() - vscroll_w
-        for e, ov in zip(self._frozen, self._frozen_views):
-            w = self._frozen_width(e)
-            if e['side'] == 'left':
-                ov.setGeometry(left_x, 0, w, total_h)
-                left_x += w
-            else:
-                right_x_end -= w
-                ov.setGeometry(right_x_end, 0, w, total_h)
+        ov_l = self._frozen_views.get('left')
+        if ov_l is not None:
+            ov_l.setGeometry(vhw, 0, self._frozen_side_width('left'), total_h)
+        ov_r = self._frozen_views.get('right')
+        if ov_r is not None:
+            w = self._frozen_side_width('right')
+            ov_r.setGeometry(self.width() - vscroll_w - w, 0, w, total_h)
 
     def _on_main_vscroll(self, value):
         self._sync_vscroll(value, self)
@@ -2056,8 +2085,8 @@ class LuaTableView(QTableView):
         self._syncing = True
         try:
             self.verticalScrollBar().setValue(value)
-            for ov in self._frozen_views:
-                if ov is not src:
+            for ov in self._frozen_views.values():
+                if ov is not None and ov is not src:
                     ov.verticalScrollBar().setValue(value)
         finally:
             self._syncing = False
@@ -2073,7 +2102,7 @@ class LuaTableView(QTableView):
     # ---- 事件过滤器：拦截视口鼠标事件 ----
     def eventFilter(self, obj, event):
         # 冻结列 overlay：转发滚轮到主视图，保持滚动一致
-        if obj in getattr(self, '_frozen_views', []) and event.type() == QEvent.Wheel:
+        if obj in getattr(self, '_frozen_views', {}).values() and event.type() == QEvent.Wheel:
             QApplication.sendEvent(self.viewport(), event)
             return True
         if obj != self.viewport():
