@@ -1523,7 +1523,10 @@ class LuaTableDelegate(QStyledItemDelegate):
         painter.save()
 
         # ---- 获取行列高亮信息 ----
-        view = self.parent()
+        # 注意：setItemDelegate 不会设置委托的 QObject 父对象（self.parent() 为 None），
+        # 必须用 option.widget（Qt 绘制时携带的视图实例）来获取视图，
+        # 这样委托被主视图与冻结列 overlay 共享时也能各自拿到正确的视图。
+        view = option.widget or self.parent()
         hl_row = -1
         hl_col = -1
         if view is not None and hasattr(view, '_highlight_row'):
@@ -1935,8 +1938,20 @@ class LuaTableView(QTableView):
         if col <= 0:
             return
         self._frozen = [e for e in self._frozen if e['col'] != col]
-        self._frozen.append({'col': col, 'side': side})
+        w = self.columnWidth(col)
+        if w <= 0:
+            w = self.horizontalHeader().sectionSizeHint(col) or 100
+        self._frozen.append({'col': col, 'side': side, 'width': w})
         self._rebuild_frozen()
+
+    def _frozen_width(self, e: dict) -> int:
+        """获取冻结列宽度（隐藏列读不到宽度，必须用冻结时记录的值）"""
+        w = e.get('width') or 0
+        if w <= 0:
+            w = self.columnWidth(e['col'])
+        if w <= 0:
+            w = self.horizontalHeader().sectionSizeHint(e['col']) or 100
+        return int(w)
 
     def unfreeze_column(self, col: int):
         self._frozen = [e for e in self._frozen if e['col'] != col]
@@ -1985,21 +2000,26 @@ class LuaTableView(QTableView):
             ov.setStyleSheet(f"QTableView {{ border: none; background: #ffffff; {border} }}")
             for c in range(model.columnCount()):
                 ov.setColumnHidden(c, c != e['col'])
-            ov.setColumnWidth(e['col'], self.columnWidth(e['col']))
+            fw = self._frozen_width(e)
+            ov.setColumnWidth(e['col'], fw)
             # 垂直滚动同步（双向，带防递归）
             ov.verticalScrollBar().valueChanged.connect(
                 lambda v, o=ov: self._sync_vscroll(v, o))
             # overlay 中改列宽 -> 同步回主视图并重排
             ov.horizontalHeader().sectionResized.connect(
-                lambda idx, old, new, ov=ov, fc=e['col']:
-                    (self.setColumnWidth(fc, new), ov.setColumnWidth(fc, new),
-                     self._layout_frozen()))
+                lambda idx, old, new, ov=ov, fc=e['col'], e=e:
+                    (e.__setitem__('width', new), self.setColumnWidth(fc, new),
+                     ov.setColumnWidth(fc, new), self._layout_frozen()))
             ov.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
             ov.horizontalHeader().customContextMenuRequested.connect(
                 lambda pos, h=ov.horizontalHeader(): self._emit_header_menu(h, pos))
             ov.verticalScrollBar().setValue(self.verticalScrollBar().value())
             ov.installEventFilter(self)
             ov.raise_()
+            # 关键：overlay 是在主窗口已显示后运行时创建的子控件，
+            # 必须显式 show()，否则它保持隐藏 -> 主视图隐藏了该列而 overlay 不可见，
+            # 表现就是“被固定的列直接消失”。
+            ov.show()
             self._frozen_views.append(ov)
 
         self._layout_frozen()
@@ -2019,7 +2039,7 @@ class LuaTableView(QTableView):
         left_x = vhw
         right_x_end = self.width() - vscroll_w
         for e, ov in zip(self._frozen, self._frozen_views):
-            w = self.columnWidth(e['col'])
+            w = self._frozen_width(e)
             if e['side'] == 'left':
                 ov.setGeometry(left_x, 0, w, total_h)
                 left_x += w
@@ -5503,6 +5523,11 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         menu.setStyleSheet("QMenu { font-size: 13px; }")
 
+        # ---- 整列删除 ----
+        del_act = menu.addAction("🗑 删除此列")
+        del_act.triggered.connect(lambda: self._delete_column(section))
+        menu.addSeparator()
+
         # ---- 列固定（冻结）选项 ----
         if view.is_column_frozen(section):
             act_u = menu.addAction("❌ 取消固定此列")
@@ -5538,6 +5563,72 @@ class MainWindow(QMainWindow):
             act.triggered.connect(lambda checked, m=mode: self._show_filter_input(section, m))
 
         menu.exec(header.mapToGlobal(pos))
+
+    # ---- 整列删除 ----
+    def _delete_column(self, proxy_col: int):
+        """删除整列（字段）。proxy_col 为视图（proxy）列号，0 为行号列不可删。"""
+        if proxy_col <= 0:
+            return
+
+        proxy = self._get_proxy()
+        model = self._get_model()
+        data = self._get_data()
+        view = self._get_view()
+        if not (proxy and model and data and view):
+            return
+
+        # proxy 列 -> 源列（FilterProxyModel 不重排列，用 mapToSource；
+        # 空表无数据行时 index(0) 无效，退化为恒等映射）
+        idx = proxy.index(0, proxy_col)
+        if idx.isValid():
+            src_col = proxy.mapToSource(idx).column()
+        else:
+            src_col = proxy_col
+        field_idx = src_col - 1
+        if not (0 <= field_idx < len(data.field_names)):
+            return
+
+        field_name = data.field_names[field_idx]
+        reply = QMessageBox.question(
+            self, "确认删除列",
+            f"确定删除整列「{field_name}」吗？\n该列的所有数据将被移除，且不可撤销。",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # 1) 从字段名中移除
+        data.field_names.pop(field_idx)
+
+        # 2) 从每一行数据中移除该字段
+        for row_entry in data.rows:
+            if row_entry.row_type == 'data':
+                row_entry.data.pop(field_name, None)
+                row_entry._dirty = True
+
+        # 3) 重新映射冻结列索引（删除列后，右侧列的 proxy 列号整体左移 1）
+        new_frozen = []
+        for e in view._frozen:
+            if e['col'] == proxy_col:
+                continue  # 被删列若是冻结列，直接移除
+            if e['col'] > proxy_col:
+                e = dict(e)
+                e['col'] -= 1
+            new_frozen.append(e)
+        view._frozen = new_frozen
+
+        # 4) 标记修改并重建模型
+        data.modified = True
+        model.set_data(data)          # 会重建列头、重复值集合，并重置视图
+        view._rebuild_frozen()        # 用新的冻结索引重建浮层
+
+        # 5) 刷新界面状态
+        self._update_tab_title()
+        self._update_statusbar()
+        # 清除可能引用了被删列的筛选
+        proxy.clear_filter()
+        self._filter_status.setText("")
+        self._status_label.setText(f"已删除列「{field_name}」")
 
     def _show_filter_input(self, column: int, mode: str):
         """弹出筛选输入对话框"""

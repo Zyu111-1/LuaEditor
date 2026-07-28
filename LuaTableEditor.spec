@@ -5,7 +5,7 @@ a = Analysis(
     ['lua_table_editor.py'],
     pathex=[],
     binaries=[],
-    datas=[('requirements.txt', '.')],
+    datas=[],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
