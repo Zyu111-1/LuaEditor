@@ -9,6 +9,7 @@ import sys
 import os
 import re
 import json
+import subprocess
 from functools import lru_cache
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -2998,6 +2999,7 @@ class WorkspacePanel(QWidget):
         if node_type == 'workspace_root':
             refresh_act = menu.addAction("🔄 刷新")
             color_act = menu.addAction("🎨 更改背景色...")
+            reveal_act = menu.addAction("📂 打开文件夹位置")
             menu.addSeparator()
             remove_act = menu.addAction("✖ 移除文件夹")
 
@@ -3007,17 +3009,23 @@ class WorkspacePanel(QWidget):
                 self._populate_recursive(item, file_path)
             elif action == color_act:
                 self._change_workspace_color(file_path)
+            elif action == reveal_act:
+                self._reveal_in_explorer(file_path)
             elif action == remove_act:
                 self.remove_folder(file_path)
 
         elif node_type == 'directory':
             refresh_act = menu.addAction("🔄 刷新子目录")
+            reveal_act = menu.addAction("📂 打开文件夹")
             action = menu.exec(self._tree.viewport().mapToGlobal(pos))
             if action == refresh_act:
                 self._populate_recursive(item, file_path)
+            elif action == reveal_act:
+                self._reveal_in_explorer(file_path)
 
         elif node_type == 'file':
             open_act = menu.addAction("📄 打开")
+            reveal_act = menu.addAction("📂 打开文件所在文件夹")
             menu.addSeparator()
             has_note = file_path in self._file_notes and bool(self._file_notes[file_path].strip())
             if has_note:
@@ -3032,6 +3040,8 @@ class WorkspacePanel(QWidget):
             if action == open_act:
                 if os.path.isfile(file_path):
                     self.file_double_clicked.emit(file_path)
+            elif action == reveal_act:
+                self._reveal_in_explorer(file_path)
             elif action == note_act:
                 self._edit_note(file_path)
             elif view_note_act and action == view_note_act:
@@ -3039,6 +3049,30 @@ class WorkspacePanel(QWidget):
                 QMessageBox.information(self, f"备注 - {os.path.basename(file_path)}", note_text)
             elif del_note_act and action == del_note_act:
                 self.set_file_note(file_path, "")
+
+    # ---- 在文件管理器中打开 ----
+    def _reveal_in_explorer(self, path: str):
+        """在系统文件管理器中打开 path 所在位置（文件则定位并选中）"""
+        if not path or not os.path.exists(path):
+            return
+        try:
+            if sys.platform.startswith('win'):
+                if os.path.isfile(path):
+                    # explorer /select, 让资源管理器定位并高亮该文件
+                    subprocess.Popen(['explorer', '/select,',
+                                      os.path.normpath(path)])
+                else:
+                    os.startfile(os.path.normpath(path))
+            elif sys.platform == 'darwin':
+                if os.path.isfile(path):
+                    subprocess.Popen(['open', '-R', path])
+                else:
+                    subprocess.Popen(['open', path])
+            else:
+                target = path if os.path.isdir(path) else os.path.dirname(path)
+                subprocess.Popen(['xdg-open', target])
+        except Exception as e:
+            QMessageBox.warning(self, "无法打开文件夹", f"打开文件夹失败：\n{e}")
 
     # ---- 颜色自定义 ----
     def _change_workspace_color(self, folder: str):
