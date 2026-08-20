@@ -17,3 +17,8 @@ _test_out.txt
 .codebuddy/
 .vscode/
 .DS_Store
+
+biaodan/
+
+# Game data (sensitive, do not commit)
+ClothData.lua

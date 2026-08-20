@@ -1581,6 +1581,8 @@ class LuaTableDelegate(QStyledItemDelegate):
         # 绘制文本（省略长文本）
         if col > 0:
             text = src.data(src_index, Qt.UserRole) or ''
+            if not isinstance(text, str):
+                text = str(text)
             rect = option.rect.adjusted(6, 0, -6, 0)
 
             # 重复值用橙红色文字 + 底部标记线
@@ -1602,7 +1604,16 @@ class LuaTableDelegate(QStyledItemDelegate):
             else:
                 painter.setPen(QColor('#202020'))
 
-            if len(text) > self.MAX_CHARS:
+            if '\n' in text or '\r' in text:
+                # 文本含真实换行符（如 Lua 里的 \n 经解析所得）：
+                # QTableView 默认 textElideMode 不换行，drawText 直接画会把 \n 当普通字符，
+                # 导致“换行不渲染”。用多行模式绘制，并裁剪超出单元格的部分。
+                painter.drawText(
+                    rect,
+                    Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap,
+                    text,
+                )
+            elif len(text) > self.MAX_CHARS:
                 elided = text[:self.MAX_CHARS] + '...'
                 painter.drawText(rect, Qt.AlignLeft | Qt.AlignVCenter, elided)
             else:
