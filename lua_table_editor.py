@@ -966,9 +966,11 @@ class LuaTableModel(QAbstractTableModel):
             val = row.data.get(fn, '')
 
             if role == Qt.DisplayRole:
+                # 显示原始值（保留真实换行符），让委托能渲染 \n；
+                # 不要经 _value_to_lua，否则真实换行会被重转义成字面 '\n'
                 if val is None or val == '':
                     return ''
-                return LuaSerializer._value_to_lua(val)
+                return val if isinstance(val, str) else str(val)
             if role == Qt.EditRole:
                 if isinstance(val, bool):
                     return 'true' if val else 'false'
@@ -976,9 +978,10 @@ class LuaTableModel(QAbstractTableModel):
                     return ''
                 return str(val) if not isinstance(val, str) else val
             if role == Qt.UserRole:
+                # 全量文本同样返回原始值（含真实换行），供委托多行绘制
                 if val is None or val == '':
                     return ''
-                return LuaSerializer._value_to_lua(val)
+                return val if isinstance(val, str) else str(val)
             if role == Qt.TextAlignmentRole:
                 return Qt.AlignLeft | Qt.AlignVCenter
         return None
