@@ -22,7 +22,8 @@ from PySide6.QtWidgets import (
     QFileDialog, QAbstractItemView, QSplitter, QFrame, QStyle,
     QStyledItemDelegate, QStyleOptionViewItem, QSizePolicy,
     QScrollArea, QInputDialog, QToolTip, QStackedWidget, QTextBrowser, QTextEdit,
-    QDialogButtonBox, QTreeWidget, QTreeWidgetItem, QColorDialog, QProgressBar
+    QDialogButtonBox, QTreeWidget, QTreeWidgetItem, QColorDialog, QProgressBar,
+    QPlainTextEdit, QAbstractItemDelegate
 )
 from PySide6.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel,
@@ -32,7 +33,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QAction, QKeySequence, QColor, QFont, QBrush, QPainter,
     QPalette, QPen, QIcon, QDragEnterEvent, QDropEvent,
-    QTextOption, QFontMetrics, QDesktopServices, QCursor
+    QTextOption, QFontMetrics, QDesktopServices, QCursor, QTextCursor
 )
 
 # ============================================================================
@@ -1423,6 +1424,73 @@ class LuaTableDelegate(QStyledItemDelegate):
     """自定义绘制委托：注释行渲染 + 长文本省略 + 提示"""
 
     MAX_CHARS = 40  # 单元格最多显示字符数
+
+    # ---- 多行编辑支持：含真实换行符的单元格用 QPlainTextEdit ----
+    def _cell_text(self, index) -> str:
+        """取单元格原始文本（源模型 UserRole，保留真实换行符）"""
+        model = index.model()
+        if isinstance(model, QSortFilterProxyModel):
+            src = model.sourceModel()
+            src_index = model.mapToSource(index)
+        else:
+            src = model
+            src_index = index
+        if isinstance(src, LuaTableModel):
+            text = src.data(src_index, Qt.UserRole)
+            return text if isinstance(text, str) else ''
+        return ''
+
+    def createEditor(self, parent, option, index):
+        # 含真实换行符的单元格：默认 QLineEdit 是单行的，显示不了换行符，
+        # 导致“无法编辑原有字符中的 \n”。换用多行编辑器。
+        text = self._cell_text(index)
+        if '\n' in text or '\r' in text:
+            ed = QPlainTextEdit(parent)
+            ed.setTabChangesFocus(True)  # Tab 移出焦点，由视图提交并跳下一格
+            return ed
+        return super().createEditor(parent, option, index)
+
+    def setEditorData(self, editor, index):
+        if isinstance(editor, QPlainTextEdit):
+            text = index.data(Qt.EditRole)
+            if not isinstance(text, str) or text == '':
+                text = self._cell_text(index)
+            editor.setPlainText(text)
+            cursor = editor.textCursor()
+            cursor.movePosition(QTextCursor.Start)
+            editor.setTextCursor(cursor)
+            return
+        super().setEditorData(editor, index)
+
+    def setModelData(self, editor, model, index):
+        if isinstance(editor, QPlainTextEdit):
+            # 原样写回，保留真实换行符
+            model.setData(index, editor.toPlainText(), Qt.EditRole)
+            return
+        super().setModelData(editor, model, index)
+
+    def updateEditorGeometry(self, editor, option, index):
+        super().updateEditorGeometry(editor, option, index)
+        if isinstance(editor, QPlainTextEdit):
+            # 按内容扩展编辑器高度（至少 3 行，至多约 260px），浮层盖在下方行上
+            doc_h = editor.document().size().height() + 12
+            line_h = editor.fontMetrics().height()
+            h = max(line_h * 3 + 8, min(doc_h, 260))
+            g = editor.geometry()
+            g.setHeight(int(h))
+            editor.setGeometry(g)
+
+    def eventFilter(self, obj, event):
+        # 多行编辑器内：Enter 插入换行（不提交），Ctrl+Enter 才提交
+        if isinstance(obj, QPlainTextEdit) and event.type() == QEvent.KeyPress:
+            key = event.key()
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                if event.modifiers() & Qt.ControlModifier:
+                    self.commitData.emit(obj)
+                    self.closeEditor.emit(obj, QAbstractItemDelegate.NoHint)
+                    return True
+                return False  # 放行给编辑器，插入换行
+        return super().eventFilter(obj, event)
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex):
         model = index.model()
