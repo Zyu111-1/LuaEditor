@@ -70,6 +70,23 @@ class LuaTableData:
     footer_raw: list = field(default_factory=list)  # "}" 之后到文件末尾的所有行（return、尾注释等），逐字保留
     # ---- 磁盘文件元信息（用于自动刷新判断）----
     file_mtime: float = 0.0   # 最近一次从磁盘读取/写入时的文件修改时间
+    # ---- 非撤销类修改标记 ----
+    # 结构性变更（增删行/列、粘贴、修复行键等）不进入 undo 栈。
+    # _finalize_undo_redo 只有在该标记也为 False 时才允许把 modified 复位，
+    # 否则"先加行→改一格→撤销"会把未保存的结构变更伪装成已保存状态（BUG-02）。
+    non_undoable_modified: bool = False
+    # ---- 文件编码/行尾元信息（保存时还原，见 _do_save / LuaLoadWorker）----
+    has_bom: bool = False     # 源文件是否带 UTF-8 BOM
+    eol: str = os.linesep     # 源文件行尾风格：'\n' / '\r\n' / '\r'
+
+
+class LuaTableStr(str):
+    """标记字符串：值来自 Lua 源码中未加引号的表表达式（如 {1,2,3} 或 {a=1}）。
+
+    序列化时原样输出（不加引号）；普通 str 一律加引号。
+    这样 "{build}" 这类"内容像表"的字符串不会丢失引号（BUG-07c），
+    而真正的子表值（解析时未带引号）仍以表形式写回。"""
+    __slots__ = ()
 
 
 # ============================================================================
@@ -88,8 +105,13 @@ class LuaParser:
     @staticmethod
     def parse(text: str) -> LuaTableData:
         data = LuaTableData()
+        # UTF-8 BOM：先剥离再解析（'\ufeff' 会让表声明正则失配，进而走
+        # "裸 {" 兜底分支，保存时丢失 "local data =" 声明行）。
+        # has_bom 记录在案，serialize 时还原。
+        if text.startswith('\ufeff'):
+            data.has_bom = True
+            text = text[1:]
         data._raw_text = text
-        raw_lines = text.split('\n')
         lines = text.strip().split('\n')
 
         # ---- 找表声明：匹配 Name = {  或  local Name = {  或  return {  ----
@@ -516,11 +538,15 @@ class LuaParser:
         if val.lower() == 'nil':
             return None
 
-        # 表/数组（保留为字符串）
+        # 表/数组（保留为原始字符串，序列化时原样输出、不加引号）
         if val.startswith('{'):
-            return val
+            return LuaTableStr(val)
 
-        # 数字
+        # 数字（含十六进制：0x1F 走 int() 会失败并退化成字符串，
+        # 保存时被 _value_to_lua 加上引号，语义从数字变成字符串）
+        if re.fullmatch(r'-?0[xX][0-9a-fA-F]+', val):
+            return int(val, 16)
+
         try:
             if '.' in val or 'e' in val.lower():
                 return float(val)
@@ -547,12 +573,13 @@ class LuaSerializer:
 
         _update_raw=True 时（保存后调用），把重新生成行的文本写回其 _raw_lines
         并清零 _dirty，使后续序列化与磁盘内容保持一致。"""
+        bom = '\ufeff' if data.has_bom else ''
         # 未修改时直接返回原始文本，保持与原文件完全一致
         if not data.modified and data._raw_text:
             if _update_raw:
                 for r in data.rows:
                     r._dirty = False
-            return data._raw_text
+            return bom + data._raw_text
 
         lines = []
 
@@ -587,7 +614,7 @@ class LuaSerializer:
             if _update_raw:
                 for r in data.rows:
                     r._dirty = False
-            return '\n'.join(lines)
+            return bom + '\n'.join(lines)
 
         INDENT = '\t'
 
@@ -610,15 +637,20 @@ class LuaSerializer:
                         continue
                     val_str = LuaSerializer._value_to_lua(val)
                     parts.append(f'{fn}={val_str}')
-                if not parts:
-                    # 空数据行（如刚创建、尚未填写任何字段的行）不写出，
-                    # 否则生成无键的空 {} 列表元素会破坏表结构
+                if not parts and not row.row_key:
+                    # 无键空数据行不写出：无键的空 {} 会作为列表元素追加，
+                    # 改变既有 [key] 行的语义。带行键的空行（如刚添加、尚未
+                    # 填字段的新行）必须落盘为 [key] = {}，否则保存后行数变少（BUG-11）。
                     if _update_raw:
                         row._raw_lines = []
                         row._dirty = False
                     continue
                 if row.row_key:
-                    line = f'{INDENT}[{row.row_key}] = {{' + ', '.join(parts) + ', },'
+                    key_str = LuaSerializer._row_key_to_lua(row.row_key)
+                    if parts:
+                        line = f'{INDENT}[{key_str}] = {{' + ', '.join(parts) + ', },'
+                    else:
+                        line = f'{INDENT}[{key_str}] = {{}},'
                 else:
                     line = f'{INDENT}{{' + ', '.join(parts) + ', },'
                 gen = [line]
@@ -638,42 +670,33 @@ class LuaSerializer:
         if data.footer_raw:
             lines.extend(data.footer_raw)
 
-        return '\n'.join(lines)
+        return bom + '\n'.join(lines)
+
+    # Lua 数字字面量（整数/十六进制/浮点/科学计数法），用于判断行键能否裸写
+    _LUA_INT_RE = re.compile(r'-?\d+')
+    _LUA_HEX_RE = re.compile(r'-?0[xX][0-9a-fA-F]+')
+    _LUA_FLOAT_RE = re.compile(r'-?(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?')
 
     @staticmethod
-    def _is_lua_table_expr(val: str) -> bool:
-        """检查字符串是否是一个完整的 Lua 表表达式（如 {1,2,3} 或 {a=1,b=2}）。
+    def _row_key_to_lua(key: str) -> str:
+        """行键 → Lua 括号键表达式的内容。
 
-        与简单 startswith('{') 不同，此方法验证：
-        1. 花括号配对正确（深度归零）
-        2. 最外层 {} 闭合后没有尾部额外字符
-        这可以区分 {1,2,3}（表）和 {{build}}闲置下来了。（字符串）。"""
-        if not val.startswith('{'):
-            return False
-        depth = 0
-        in_string = False
-        sq = ''
-        esc = False
-        for i, ch in enumerate(val):
-            if esc:
-                esc = False
-                continue
-            if ch == '\\' and in_string:
-                esc = True
-                continue
-            if ch in ('"', "'") and not in_string:
-                in_string = True
-                sq = ch
-            elif ch == sq and in_string:
-                in_string = False
-            elif ch == '{' and not in_string:
-                depth += 1
-            elif ch == '}' and not in_string:
-                depth -= 1
-                # 最外层花括号闭合后，不能再有非空白字符
-                if depth == 0 and i < len(val) - 1:
-                    return False
-        return depth == 0
+        - 数字键（含十六进制/浮点字面量）原样输出：[10001]
+        - 已带引号的键原样输出：['name'] / ["name"]
+        - 其余视为字符串键，自动加双引号并转义：[my_key] -> ["my_key"]
+          （否则会生成 [my_key] = {...} 这类非法 Lua，BUG-07a）"""
+        key = key.strip()
+        if not key:
+            return key
+        for pat in (LuaSerializer._LUA_INT_RE,
+                    LuaSerializer._LUA_HEX_RE,
+                    LuaSerializer._LUA_FLOAT_RE):
+            if pat.fullmatch(key):
+                return key
+        if len(key) >= 2 and key[0] == key[-1] and key[0] in ('"', "'"):
+            return key
+        escaped = key.replace('\\', '\\\\').replace('"', '\\"')
+        return f'"{escaped}"'
 
     @staticmethod
     def _value_to_lua(val: Any) -> str:
@@ -681,13 +704,15 @@ class LuaSerializer:
             return 'nil'
         if isinstance(val, bool):
             return 'true' if val else 'false'
+        if isinstance(val, LuaTableStr):
+            # 未加引号解析得到的子表表达式：原样写回，不加引号
+            return str(val)
         if isinstance(val, str):
-            if LuaSerializer._is_lua_table_expr(val):
-                return val
-            # 逐字符转义，避免链式 replace 的交叉干扰
-            # 注意：不转义反斜杠，保留原始文本中的 \n \r \t 等字符
+            # 逐字符转义，避免链式 replace 的交叉干扰。
+            # 反斜杠必须转义：内存中的字面 "a\nb"（反斜杠+n 两个字符）若不转义，
+            # 写回 "a\nb" 会被 Lua 解释成换行，语义改变（BUG-07b）。
             _ESC_MAP = {
-                '"': '\\"', '\n': '\\n',
+                '\\': '\\\\', '"': '\\"', '\n': '\\n',
                 '\r': '\\r', '\t': '\\t', '\0': '\\0',
             }
             escaped = ''.join(_ESC_MAP.get(ch, ch) for ch in val)
@@ -708,6 +733,7 @@ class LuaTableModel(QAbstractTableModel):
     ROW_HEADER_COMMENT = 'header_comment'  # 文件头注释（如 -- ActionData.xlsx）
     ROW_DATA = 'data'                      # 数据行
     ROW_INLINE_COMMENT = 'inline_comment'  # 内联注释行
+    ROW_BLANK = 'blank'                    # 表体中的空行（不可编辑，仅占位保留原文）
     ROW_RETURN = 'return'                  # return data 行
 
     # 类级别缓存：行号列字体（避免每行 data() 调用都创建 QFont）
@@ -728,6 +754,9 @@ class LuaTableModel(QAbstractTableModel):
         self._redo_stack: list = []  # [(row, col, new_value), ...]
         self._duplicate_set: dict = {}  # {(col, value_str): True} 用于重复值高亮
         self._resetting: bool = False  # 防重入标志，阻止嵌套模型重置
+        # 行号前缀缓存：_row_seq[i] = data.rows[i] 之前出现的数据行数。
+        # data() 的行号列直接查表，避免每格做 O(N) 前缀求和（整体 O(N²)，PERF-01）。
+        self._row_seq: list = []
 
     def safe_notify_reset(self):
         """安全刷新模型视图：beginResetModel/endResetModel 配对，防重入"""
@@ -779,8 +808,12 @@ class LuaTableModel(QAbstractTableModel):
         """
         将表格逻辑行索引映射到 (row_type, real_index)
         - header_comment → ('header_comment', comment_index)
-        - data/comment   → ('data'|'comment', data_index)
+        - data/comment/blank → ('data'|'comment'|'blank', data_index)
         - return         → ('return', None)
+
+        注意：所有访问 data.rows 的代码都必须经过本方法（或
+        _logical_to_data_row）完成逻辑行 → 数据下标的换算，禁止直接用
+        逻辑行号索引 data.rows（BUG-01 的根因）。
         """
         hc = self._header_count
         dr_count = len(self._data.rows) if self._data else 0
@@ -792,13 +825,40 @@ class LuaTableModel(QAbstractTableModel):
             entry = self._data.rows[data_idx]
             if entry.row_type == 'comment':
                 return (self.ROW_INLINE_COMMENT, data_idx)
+            if entry.row_type == 'blank':
+                return (self.ROW_BLANK, data_idx)
             return (self.ROW_DATA, data_idx)
         if self._has_return and idx == hc + dr_count:
             return (self.ROW_RETURN, None)
         return (None, None)
 
+    def _rebuild_row_seq(self):
+        """重建行号前缀缓存（见 __init__ 注释）。
+
+        行的 row_type 会被就地修改（注释/取消注释、填充柄把空行转数据行），
+        因此除增删行外，这些路径也必须刷新本缓存——统一挂在
+        _rebuild_duplicates() 里同步执行，另在 endInsertRows/endRemoveRows
+        中兜底。"""
+        seq = []
+        n = 0
+        if self._data:
+            for e in self._data.rows:
+                seq.append(n)
+                if e.row_type == 'data':
+                    n += 1
+        self._row_seq = seq
+
+    def endInsertRows(self):
+        super().endInsertRows()
+        self._rebuild_row_seq()
+
+    def endRemoveRows(self):
+        super().endRemoveRows()
+        self._rebuild_row_seq()
+
     def _rebuild_duplicates(self):
-        """重建重复值集合，用于高亮显示"""
+        """重建重复值集合，用于高亮显示（同时刷新行号前缀缓存）"""
+        self._rebuild_row_seq()
         self._duplicate_set.clear()
         if not self._data:
             return
@@ -881,9 +941,10 @@ class LuaTableModel(QAbstractTableModel):
                         return row_entry.row_key
                     if row_type == self.ROW_INLINE_COMMENT:
                         return '--'  # 注释行不占数据序号
-                    # 数据行：只计算纯数据行（不含内联注释）的位置序号
-                    data_num = sum(1 for e in self._data.rows[:real_idx + 1] if e.row_type == 'data')
-                    return str(data_num)
+                    # 数据行序号：查前缀缓存（O(1)，替代逐格 O(N) 求和，PERF-01）
+                    if 0 <= real_idx < len(self._row_seq):
+                        return str(self._row_seq[real_idx] + 1)
+                    return ''
                 return ''
             if role == Qt.TextAlignmentRole:
                 return Qt.AlignCenter
@@ -1022,19 +1083,27 @@ class LuaTableModel(QAbstractTableModel):
             row_entry = self._data.rows[real_idx]
             if col == 1:
                 old_val = row_entry.comment_text
-                if old_val == str(value):
+                new_text = str(value)
+                # 强制保持注释形态：保存后该行必须仍以 '--' 开头，
+                # 否则重新加载时解析器不识别为注释，行会被静默丢弃
+                if new_text.strip() and not new_text.lstrip().startswith('--'):
+                    new_text = '-- ' + new_text.lstrip()
+                if old_val == new_text:
                     return False
                 # real_idx 是 data.rows 索引，undo 需要用此值直接访问 data.rows
                 self._undo_stack.append((real_idx, col, old_val))
                 self._redo_stack.clear()
-                row_entry.comment_text = str(value)
+                row_entry.comment_text = new_text
                 row_entry._dirty = True
                 self._data.modified = True
                 self.dataChanged.emit(index, index)
                 return True
             return False
 
-        # 数据行
+        # 数据行（空行不可编辑：flags 已拒绝，此处兜底防止绕过 UI 的直接调用。
+        # 空行若允许写入，序列化固定输出空串，用户输入会被静默丢弃，BUG-03）
+        if row_type == self.ROW_BLANK:
+            return False
         row_entry = self._data.rows[real_idx]
 
         field_names = self._data.field_names
@@ -1117,10 +1186,15 @@ class LuaTableModel(QAbstractTableModel):
         return False
 
     def _finalize_undo_redo(self):
-        """撤销/重做完单次操作后调用：若全部撤销完毕则复位 modified 与脏标记，保证零 diff"""
+        """撤销/重做完单次操作后调用：若全部撤销完毕则复位 modified 与脏标记，保证零 diff
+
+        只有当撤销栈为空 *且* 没有发生过不可撤销的修改（增删行/列、粘贴、
+        修复行键等，见 non_undoable_modified）时才允许复位。否则
+        "先加行 → 改一格 → Ctrl+Z" 会把未保存的结构变更伪装成已保存状态，
+        关闭标签页时静默丢数据（BUG-02）。"""
         if not self._data:
             return
-        if not self._undo_stack:
+        if not self._undo_stack and not self._data.non_undoable_modified:
             # 所有操作已撤销 → 内存状态回到加载时，整文件未修改
             self._data.modified = False
             for r in self._data.rows:
@@ -1285,7 +1359,11 @@ class LuaTableModel(QAbstractTableModel):
 
     @staticmethod
     def _next_default_row_key(data) -> str:
-        """为新数据行计算一个默认行键：取现有数字键的最大值 + 1，无数字键则为 1。"""
+        """为新数据行计算一个默认行键：取现有数字键的最大值 + 1。
+
+        表中没有任何数字行键（匿名数组表）时返回空串：此时强行赋予 [1] 这类
+        键会与数组下标语义冲突（Lua 中 [1] = x 会覆盖第 1 个数组元素），
+        新行应保持匿名，由序列化按 {...} 追加到表尾。"""
         max_key = 0
         for r in data.rows:
             if r.row_type == 'data' and r.row_key:
@@ -1295,7 +1373,7 @@ class LuaTableModel(QAbstractTableModel):
                         max_key = n
                 except ValueError:
                     pass
-        return str(max_key + 1)
+        return str(max_key + 1) if max_key > 0 else ''
 
     def add_data_row(self, row_pos: int = -1):
         """添加数据行（row_pos 为表格逻辑行号，负数表示追加到末尾）"""
@@ -1310,6 +1388,7 @@ class LuaTableModel(QAbstractTableModel):
         new_row = RowEntry(row_type='data', row_key=self._next_default_row_key(self._data))
         self._data.rows.insert(data_row_pos, new_row)
         self._data.modified = True
+        self._data.non_undoable_modified = True  # 增行不可撤销，见 _finalize_undo_redo
         self.endInsertRows()
 
     def add_data_rows_batch(self, count: int, row_pos: int = -1):
@@ -1321,11 +1400,23 @@ class LuaTableModel(QAbstractTableModel):
             row_pos = self.rowCount()
         data_row_pos = self._logical_to_data_row(row_pos)
         self.beginInsertRows(QModelIndex(), row_pos, row_pos + count - 1)
-        for _ in range(count):
-            # 逐行计算默认键，保证批量新增的键互不冲突
+        # 键从当前最大值连续递增：避免每行都全表扫描求最大键（PERF-03）。
+        # 匿名数组表（无数字键）保持匿名，理由同 _next_default_row_key。
+        max_key = 0
+        for r in self._data.rows:
+            if r.row_type == 'data' and r.row_key:
+                try:
+                    n = int(r.row_key)
+                    if n > max_key:
+                        max_key = n
+                except ValueError:
+                    pass
+        for i in range(count):
+            key = str(max_key + 1 + i) if max_key > 0 else ''
             self._data.rows.insert(data_row_pos,
-                                   RowEntry(row_type='data', row_key=self._next_default_row_key(self._data)))
+                                   RowEntry(row_type='data', row_key=key))
         self._data.modified = True
+        self._data.non_undoable_modified = True
         self.endInsertRows()
 
     def add_comment_row(self, row_pos: int = -1):
@@ -1338,6 +1429,7 @@ class LuaTableModel(QAbstractTableModel):
         self.beginInsertRows(QModelIndex(), row_pos, row_pos)
         self._data.rows.insert(data_row_pos, RowEntry(row_type='comment', comment_text='-- '))
         self._data.modified = True
+        self._data.non_undoable_modified = True
         self.endInsertRows()
 
     def remove_row(self, row: int):
@@ -1345,8 +1437,8 @@ class LuaTableModel(QAbstractTableModel):
         if not self._data or row < 0:
             return
         row_type, real_idx = self._resolve_row(row)
-        # 不允许删除头注释和return行
-        if row_type in (self.ROW_HEADER_COMMENT, self.ROW_RETURN):
+        # 不允许删除头注释、return 行和空行（空行是原文件的格式内容，删除等价于改写原文）
+        if row_type in (self.ROW_HEADER_COMMENT, self.ROW_RETURN, self.ROW_BLANK):
             return
         # 内联注释或数据行：删除 self._data.rows[real_idx]
         if real_idx is None or real_idx >= len(self._data.rows):
@@ -1354,6 +1446,7 @@ class LuaTableModel(QAbstractTableModel):
         self.beginRemoveRows(QModelIndex(), row, row)
         del self._data.rows[real_idx]
         self._data.modified = True
+        self._data.non_undoable_modified = True
         self.endRemoveRows()
 
     def get_row_text(self, row: int) -> str:
@@ -1824,12 +1917,19 @@ class FilterProxyModel(QSortFilterProxyModel):
         if model.is_comment_row(source_row):
             return True  # 注释行不过滤
 
+        # 逻辑行 → 数据下标必须经 _resolve_row 换算（BUG-01）：
+        # 此前直接 model._data.rows[source_row]，在带表头注释的表上错位、
+        # 在 return 行上越界抛 IndexError。
+        row_type, real_idx = model._resolve_row(source_row)
+        if row_type != LuaTableModel.ROW_DATA or real_idx is None:
+            return True  # 头注释/return/空行等结构行不参与筛选
+
         col = self._filter_column
         if col <= 0 or col - 1 >= len(model._data.field_names):
             return True
 
         fn = model._data.field_names[col - 1]
-        row = model._data.rows[source_row]
+        row = model._data.rows[real_idx]
         val = str(row.data.get(fn, '')).lower()
         ft = self._filter_text.lower()
 
@@ -1843,8 +1943,14 @@ class FilterProxyModel(QSortFilterProxyModel):
             return ft not in val
         return True
 
-    def set_search(self, text: str):
-        """设置查找文本，计算所有匹配行"""
+    def set_search(self, text: str, case_sensitive: bool = False,
+                   all_columns: bool = True, column: int = 1):
+        """设置查找文本，计算所有匹配行。
+
+        case_sensitive: 区分大小写（此前该选项从未生效，BUG-14）
+        all_columns:    True 搜索整行所有列；False 只搜 column 指定列
+        column:         单列模式下的源模型列号（1 起，0 为行号列）
+        """
         self._search_text = text
         self._search_results = []
         self._current_search_idx = -1
@@ -1856,9 +1962,17 @@ class FilterProxyModel(QSortFilterProxyModel):
         if not isinstance(model, LuaTableModel):
             return
 
-        text_lower = text.lower()  # 提到循环外，避免 O(N) 次重复计算
+        needle = text if case_sensitive else text.lower()
         for row in range(model.rowCount()):
-            if text_lower in model.get_row_text(row).lower():
+            if all_columns:
+                hay = model.get_row_text(row)
+            else:
+                hay = model.get_full_value(row, max(1, column))
+            if not hay:
+                hay = ''
+            if not case_sensitive:
+                hay = hay.lower()
+            if needle in hay:  # needle 只算一次，避免 O(N) 次重复计算
                 self._search_results.append(row)
 
     def next_search_result(self) -> int:
@@ -1951,12 +2065,16 @@ class LuaTableView(QTableView):
         key = event.key()
         text = event.text()
 
-        # Backspace：清空当前单元格，不进入编辑模式
-        if key == Qt.Key_Backspace or key == Qt.Key_Delete:
-            if isinstance(src, LuaTableModel) and src.flags(idx) & Qt.ItemIsEditable:
-                proxy_idx = self.model().index(idx.row(), idx.column()) \
-                    if isinstance(self.model(), QSortFilterProxyModel) else idx
-                self.model().setData(proxy_idx, '')
+        # Backspace：清空当前单元格，不进入编辑模式。
+        # Delete 专属菜单动作"删除当前行"（QAction 的 WindowShortcut 优先级高于
+        # 视图按键，视图内的 Delete 分支从未生效，保留只会误导，BUG-08）。
+        if key == Qt.Key_Backspace:
+            # 可编辑性判定必须用源模型索引：idx 是视图(proxy)坐标，此前直接把
+            # proxy 索引喂给 src.flags()，筛选后判定的是别的行（BUG-10）
+            src_idx = model.mapToSource(idx) if isinstance(model, QSortFilterProxyModel) else idx
+            if isinstance(src, LuaTableModel) and src.flags(src_idx) & Qt.ItemIsEditable:
+                # idx 本身就是视图坐标，setData 经代理自动映射到源模型
+                self.model().setData(idx, '')
                 self.viewport().update()
             return
 
@@ -2293,10 +2411,13 @@ class LuaTableView(QTableView):
         need_rows = max(0, last_data_idx + n + 1 - len(data.rows))
         if need_rows > 0:
             # 在 data.rows 末尾追加，使用安全刷新而不调用有问题的 beginInsertRows
+            # 注：_next_default_row_key 是 LuaTableModel 的静态方法，
+            # 此前误写成 self.（视图无此方法），填充拖过表尾会 AttributeError
             for _ in range(need_rows):
                 data.rows.append(RowEntry(row_type='data',
-                                          row_key=self._next_default_row_key(data)))
+                                          row_key=LuaTableModel._next_default_row_key(data)))
             data.modified = True
+            data.non_undoable_modified = True  # 追加行不可撤销
             src.safe_notify_reset()
 
         # 执行填充 — 使用正确的 data.rows 索引
@@ -2322,6 +2443,9 @@ class LuaTableView(QTableView):
                 re._dirty = True
 
         # 通知视图更新填充区域（转换 data.rows 索引 → 逻辑行号）
+        # 填充可能就地把空行转成数据行（row_type 变化影响行号前缀缓存与
+        # 重复值集合），统一重建
+        src._rebuild_duplicates()
         if len(data.rows) > last_data_idx:
             first_visual = last_data_idx + 1 + hc
             last_visual = min(last_data_idx + n, len(data.rows) - 1) + hc
@@ -2484,11 +2608,23 @@ class FindDialog(QDialog):
         close_btn.clicked.connect(self.close)
         self.search_input.textChanged.connect(self.on_text_changed)
         self.search_input.returnPressed.connect(self.on_next)
+        # 选项变化立即重跑查找（BUG-14：此前两个复选框从未接入查找逻辑）
+        self.case_sensitive.toggled.connect(self._refresh_search)
+        self.whole_column.toggled.connect(self._refresh_search)
 
         self.search_input.setFocus()
 
     def _mw(self):
         return self._main_window
+
+    def get_options(self):
+        """返回 (case_sensitive, all_columns)，供 perform_search 使用"""
+        return (self.case_sensitive.isChecked(), self.whole_column.isChecked())
+
+    def _refresh_search(self):
+        if self._mw() and self.search_input.text():
+            self._mw().perform_search(self.search_input.text())
+            self._update_result_label()
 
     def on_text_changed(self, text):
         if self._mw():
@@ -3528,11 +3664,23 @@ class LuaLoadWorker(QThread):
 
     def run(self):
         try:
-            with open(self._file_path, 'r', encoding='utf-8') as f:
+            # newline=''：禁用通用换行翻译，拿到文件真实的行尾，
+            # 否则 CRLF 在读取时被归一化，无法在保存时还原（BUG-05）。
+            with open(self._file_path, 'r', encoding='utf-8', newline='') as f:
                 text = f.read()
-            data = LuaParser.parse(text)
+            # 行尾检测：内部统一用 '\n'，保存时按 data.eol 还原
+            if '\r\n' in text:
+                data_eol = '\r\n'
+            elif '\r' in text:
+                data_eol = '\r'
+            else:
+                data_eol = '\n'
+            norm = text.replace('\r\n', '\n').replace('\r', '\n')
+            data = LuaParser.parse(norm)
+            data.eol = data_eol
             data.file_path = self._file_path
             data.modified = False
+            data.non_undoable_modified = False
             data.file_mtime = os.path.getmtime(self._file_path)
             self.signals.finished.emit(data, self._file_path)
         except Exception as e:  # 解析/读取异常统一回传
@@ -3555,15 +3703,23 @@ class MainWindow(QMainWindow):
         self._workers: list = []  # 后台加载线程引用，避免被提前回收
         self._context_row = -1  # 右键所在行（用于复制/粘贴整行）
 
-        # 定时自动刷新：对“未修改且磁盘已变更”的已打开表静默重载
-        self._auto_refresh_enabled = True
+        # 最近文件（QSettings 需在读取 autoRefresh 设置前创建）
+        self._settings = QSettings("LuaTableEditor", "LuaTableEditor")
+
+        # 定时自动刷新：对“未修改且磁盘已变更”的已打开表静默重载。
+        # 开关状态持久化（BUG-09：此前每次启动都强制回到开启，用户无法长期关闭）
+        raw_flag = self._settings.value("autoRefresh", True)
+        if isinstance(raw_flag, str):
+            self._auto_refresh_enabled = raw_flag.strip().lower() in ('true', '1', 'yes')
+        else:
+            self._auto_refresh_enabled = bool(raw_flag)
         self._auto_refresh_timer = QTimer(self)
         self._auto_refresh_timer.setInterval(30000)  # 30 秒
         self._auto_refresh_timer.timeout.connect(self._auto_refresh_all)
         self._auto_refresh_timer.start()
 
-        # 最近文件
-        self._settings = QSettings("LuaTableEditor", "LuaTableEditor")
+        # 待打开文件队列：后台加载有全局互斥，多文件拖放需排队（BUG-29）
+        self._pending_opens: list = []
         self._recent_files = self._load_recent_files()
         self._workspace_folders = self._load_workspace_folders()
         self._file_notes: dict = self._load_file_notes()
@@ -3654,8 +3810,9 @@ class MainWindow(QMainWindow):
         return act
 
     def _toggle_auto_refresh(self, checked: bool):
-        """切换定时自动刷新开关"""
+        """切换定时自动刷新开关（状态持久化，BUG-09）"""
         self._auto_refresh_enabled = checked
+        self._settings.setValue("autoRefresh", checked)
         if checked:
             # 立即检查一次，避免开启后还要等一个周期
             self._auto_refresh_all()
@@ -3988,8 +4145,9 @@ class MainWindow(QMainWindow):
             table_view._on_current_changed
         )
 
-        # 数据变化时更新标题
-        model.dataChanged.connect(lambda: self._update_tab_title())
+        # 数据变化时更新标题（按 tab 定位，后台标签页也能正确刷新，BUG-18）
+        model.dataChanged.connect(
+            lambda *args, _tab=tab: self._update_tab_title(self._tabs_data.get(id(_tab))))
         table_view.fill_completed.connect(lambda: self._on_fill_completed(tab))
         table_view.copy_requested.connect(self._copy_selection)
         table_view.paste_requested.connect(self._paste_at_selection)
@@ -4046,6 +4204,9 @@ class MainWindow(QMainWindow):
 
     def _auto_resize_columns(self, view: QTableView):
         """自动调整列宽以适应内容"""
+        # 该方法经 QTimer 延迟调用，期间标签页可能已被关闭，视图对象已销毁（BUG-13）
+        if not any(td['view'] is view for td in self._tabs_data.values()):
+            return
         header = view.horizontalHeader()
         header.resizeSection(0, 50)  # 行号列固定
         # 一次性测量所有列，避免重复 O(n_cols * n_rows * n_cols) 的代价
@@ -4174,9 +4335,13 @@ class MainWindow(QMainWindow):
             display_title = clean_title
         td['display_title'] = display_title
 
-    def _update_tab_title(self):
-        """更新当前标签页标题（加 * 表示已修改）"""
-        td = self._get_current_tab_data()
+    def _update_tab_title(self, td: dict = None):
+        """更新标签页标题（加 * 表示已修改）。
+
+        td 缺省时更新当前标签页；显式传入时按 td['tab'] 定位——后台标签页
+        的模型数据变化也能刷新到正确标题（此前固定用 currentIndex，BUG-18）。"""
+        if td is None:
+            td = self._get_current_tab_data()
         if not td:
             return
         data = td['data']
@@ -4194,7 +4359,7 @@ class MainWindow(QMainWindow):
             self._update_tab_path_label(td)
         else:
             display_title = modified_prefix + clean_title
-        idx = self._tab_widget.currentIndex()
+        idx = self._tab_widget.indexOf(td['tab'])
         if idx >= 0:
             self._tab_widget.setTabText(idx, display_title)
 
@@ -4202,6 +4367,25 @@ class MainWindow(QMainWindow):
         """标签页切换"""
         self._detail_panel.hide_detail()
         self._update_statusbar()
+        self._sync_filter_status()
+
+    def _sync_filter_status(self):
+        """把永久筛选标签同步为当前标签页的筛选状态。
+
+        此前切换标签页不刷新该标签，会残留上一张表的筛选条件（BUG-17）。"""
+        proxy = self._get_proxy()
+        if proxy and proxy.is_filtering:
+            mode_labels = {
+                'equals': '=', 'not_equals': '≠',
+                'contains': '包含', 'not_contains': '不包含',
+            }
+            self._filter_status.setText(
+                f"筛选: 列 {proxy._filter_column} "
+                f"{mode_labels.get(proxy._filter_mode, proxy._filter_mode)} "
+                f"\"{proxy._filter_text}\""
+            )
+        else:
+            self._filter_status.setText("")
 
     def _on_tab_close_request(self, index):
         """请求关闭标签页"""
@@ -4210,10 +4394,10 @@ class MainWindow(QMainWindow):
 
     # ---- 文件操作 ----
     def _new_table(self):
-        """新建空白表"""
+        """新建空白表（默认提供 id 列：无列的空表无法进行任何可见操作，BUG-27）"""
         c = self._untitled_counter
         self._untitled_counter += 1
-        data = LuaTableData(table_name=f"NewTable{c}", field_names=[])
+        data = LuaTableData(table_name=f"NewTable{c}", field_names=['id'])
         data.modified = False
         title = f"未命名{c}.lua"
         self._create_tab(data, title)
@@ -4313,6 +4497,8 @@ class MainWindow(QMainWindow):
             if show_progress:
                 self._loading_progress.hide()
                 self._loading = False
+            # 当前加载结束，继续排空多文件拖放队列（BUG-29）
+            self._drain_pending_opens()
 
     def _on_load_error(self, msg, show_progress, auto):
         if show_progress:
@@ -4322,10 +4508,19 @@ class MainWindow(QMainWindow):
             self._status_label.setText(f"自动刷新失败: {msg}")
         else:
             QMessageBox.critical(self, "加载失败", f"无法加载文件:\n{msg}")
+        self._drain_pending_opens()
+
+    def _drain_pending_opens(self):
+        """依次打开排队的文件；一旦某次加载启动（_loading=True）即让出，
+        由 _on_load_finished/_on_load_error 继续排空（BUG-29）。"""
+        while self._pending_opens and not self._loading:
+            path = self._pending_opens.pop(0)
+            self._open_file_path(path)
 
     def _on_worker_done(self, worker):
         if worker in self._workers:
             self._workers.remove(worker)
+        worker.deleteLater()  # 释放 QThread 对象，避免累积泄漏（BUG-32）
 
     def _save_file(self):
         """保存当前文件"""
@@ -4360,14 +4555,22 @@ class MainWindow(QMainWindow):
 
         text = LuaSerializer.serialize(data, _update_raw=True)
 
+        # 行尾还原：内部统一 '\n'，写盘时按源文件行尾风格输出（BUG-05）。
+        # newline='' 禁用文本模式的二次翻译，避免 CRLF 被写成 \r\r\n。
+        out = text if data.eol == '\n' else text.replace('\n', data.eol)
+
+        # 原子保存（BUG-26）：先写临时文件再替换，进程中断不会留下半截文件
+        tmp_path = file_path + '.lte_tmp'
         try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(text)
+            with open(tmp_path, 'w', encoding='utf-8', newline='') as f:
+                f.write(out)
+            os.replace(tmp_path, file_path)
             # 保存成功后刷新原始文本并清零脏标记：
             # 否则再次保存（未继续修改）会命中 not modified 分支返回旧文本，造成静默回滚
             data._raw_text = text
             data.file_path = file_path
             data.modified = False
+            data.non_undoable_modified = False
             data.file_mtime = os.path.getmtime(file_path)  # 更新 mtime，避免被自动刷新误判为变更
             td = self._get_current_tab_data()
             td['title'] = os.path.basename(file_path)
@@ -4376,6 +4579,11 @@ class MainWindow(QMainWindow):
             self._add_recent_file(file_path)
             self._status_label.setText(f"已保存: {file_path}")
         except Exception as e:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
             QMessageBox.critical(self, "错误", f"保存失败:\n{e}")
 
     def _refresh_file(self):
@@ -4419,6 +4627,9 @@ class MainWindow(QMainWindow):
             return
 
         def on_loaded(new_data, file_path):
+            # 重新校验：加载期间标签页可能已被关闭（td 失效，BUG-13）
+            if self._tabs_data.get(id(td['tab'])) is not td:
+                return
             # 重新校验：若加载期间该表被改成已修改，放弃覆盖以免丢失编辑
             if data.modified:
                 return
@@ -4739,10 +4950,17 @@ class MainWindow(QMainWindow):
                 proxy.mapToSource(proxy.index(r, 0)).row() if proxy else r
                 for r in proxy_rows
             ))
-            # 先删除选中行，再插入
-            for r in reversed(src_rows):
-                model.remove_row(r)
-            insert_at = min(src_rows)  # 逻辑行
+            # 只删除可删除的数据行/内联注释行：选区若包含头注释/return/空行，
+            # remove_row 会拒绝但 insert_at 仍按其行号计算，导致插入位置漂移（BUG-12）
+            src_rows = [r for r in src_rows
+                        if model._resolve_row(r)[0] in (model.ROW_DATA, model.ROW_INLINE_COMMENT)]
+            if src_rows:
+                # 先删除选中行，再插入
+                for r in reversed(src_rows):
+                    model.remove_row(r)
+                insert_at = min(src_rows)  # 逻辑行
+            else:
+                insert_at = model.rowCount() - 1 if model._has_return else model.rowCount()
             for i, entry in enumerate(entries):
                 pos = insert_at + i   # 逻辑行
                 model.add_data_row(pos)
@@ -4768,7 +4986,13 @@ class MainWindow(QMainWindow):
             for i, entry in enumerate(entries):
                 tr_logical = target_min_row + i  # 逻辑行
                 t_row_type, t_data_idx = model._resolve_row(tr_logical)
-                if t_data_idx is None or t_row_type not in (LuaTableModel.ROW_DATA, LuaTableModel.ROW_INLINE_COMMENT):
+                if t_row_type == LuaTableModel.ROW_BLANK:
+                    # 空行作为粘贴目标：就地转成数据行（否则填入内容会被
+                    # 序列化丢弃——空行固定输出空串，静默丢失）
+                    blank_row = data.rows[t_data_idx]
+                    blank_row.row_type = 'data'
+                    blank_row.data = {}
+                elif t_data_idx is None or t_row_type not in (LuaTableModel.ROW_DATA, LuaTableModel.ROW_INLINE_COMMENT):
                     # 超出数据行范围，追加新行
                     apos = model.rowCount() - 1 if model._has_return else model.rowCount()
                     model.add_data_row(apos)
@@ -4868,9 +5092,15 @@ class MainWindow(QMainWindow):
                 proxy.mapToSource(proxy.index(r, 0)).row() if proxy else r
                 for r in proxy_rows
             ))
-            for r in reversed(src_rows):
-                model.remove_row(r)
-            insert_at = min(src_rows)  # 逻辑行
+            # 与 _paste_internal 相同：只删可删除行，防止插入位置漂移（BUG-12）
+            src_rows = [r for r in src_rows
+                        if model._resolve_row(r)[0] in (model.ROW_DATA, model.ROW_INLINE_COMMENT)]
+            if src_rows:
+                for r in reversed(src_rows):
+                    model.remove_row(r)
+                insert_at = min(src_rows)  # 逻辑行
+            else:
+                insert_at = model.rowCount() - 1 if model._has_return else model.rowCount()
             for i, cells in enumerate(rows_data):
                 pos = insert_at + i  # 逻辑行
                 model.add_data_row(pos)
@@ -4886,7 +5116,12 @@ class MainWindow(QMainWindow):
             for ri, cells in enumerate(rows_data):
                 tr_logical = target_min_row + ri  # 逻辑行
                 t_row_type, t_data_idx = model._resolve_row(tr_logical)
-                if t_data_idx is None or t_row_type not in (LuaTableModel.ROW_DATA, LuaTableModel.ROW_INLINE_COMMENT):
+                if t_row_type == LuaTableModel.ROW_BLANK:
+                    # 空行就地转为数据行，避免填入内容被序列化丢弃
+                    blank_row = data.rows[t_data_idx]
+                    blank_row.row_type = 'data'
+                    blank_row.data = {}
+                elif t_data_idx is None or t_row_type not in (LuaTableModel.ROW_DATA, LuaTableModel.ROW_INLINE_COMMENT):
                     # 超出数据行范围，追加新行
                     if model._has_return:
                         apos = model.rowCount() - 1
@@ -5049,7 +5284,14 @@ class MainWindow(QMainWindow):
             src_idx = proxy.mapToSource(idx) if proxy else idx
             rows_set.add(src_idx.row())
 
-        rows = sorted(rows_set, reverse=True)
+        # 只统计可删除的行（数据行/内联注释行）。头注释、return、空行由
+        # remove_row 拒绝，若计入会与实际删除数不符（BUG-19）
+        rows = sorted(
+            (r for r in rows_set
+             if model._resolve_row(r)[0] in (model.ROW_DATA, model.ROW_INLINE_COMMENT)),
+            reverse=True)
+        if not rows:
+            return
 
         reply = QMessageBox.question(
             self, "确认删除",
@@ -5077,24 +5319,39 @@ class MainWindow(QMainWindow):
             return
 
         restored_count = 0
+        conflicts = 0
+        # 现有键集合：修复产生的键不得与已有键重复，否则 Lua 中会静默覆盖（BUG-25）
+        used_keys = {r.row_key for r in data.rows if r.row_type == 'data' and r.row_key}
         for row_entry in data.rows:
             if row_entry.row_type == 'data' and not row_entry.row_key:
                 row_id = row_entry.data.get('id')
                 if row_id is not None and row_id != '':
-                    row_entry.row_key = str(row_id)
+                    new_key = str(row_id)
+                    if new_key in used_keys:
+                        conflicts += 1
+                        continue
+                    used_keys.add(new_key)
+                    row_entry.row_key = new_key
                     row_entry._dirty = True
                     restored_count += 1
 
         if restored_count > 0:
             data.modified = True
+            data.non_undoable_modified = True  # 修复行键不可撤销
             model.safe_notify_reset()
             self._update_statusbar()
             self._update_tab_title()
-            QMessageBox.information(self, "修复完成",
-                                    f"已从 'id' 字段恢复了 {restored_count} 行的 [key] = 格式。\n"
-                                    "请保存文件以保留更改。")
+            msg = (f"已从 'id' 字段恢复了 {restored_count} 行的 [key] = 格式。\n"
+                   "请保存文件以保留更改。")
+            if conflicts:
+                msg = f"另有 {conflicts} 行因与现有行键重复被跳过。\n" + msg
+            QMessageBox.information(self, "修复完成", msg)
         else:
-            QMessageBox.information(self, "无需修复", "所有数据行都已有行键，无需修复。")
+            msg = "所有数据行都已有行键，无需修复。"
+            if conflicts:
+                msg = (f"有 {conflicts} 行待恢复，但其 id 与现有行键重复，"
+                       "已跳过以避免生成重复键。")
+            QMessageBox.information(self, "无需修复", msg)
 
     # ---- 批量同步选中行的行键（与 id 一致）----
     def _batch_sync_row_keys(self):
@@ -5130,22 +5387,37 @@ class MainWindow(QMainWindow):
 
         synced = 0
         skipped = 0
+        conflicts = 0
+        # 同步产生的键不得与其它行重复，否则 Lua 侧静默覆盖（BUG-25）
+        used_keys = {data.rows[i].row_key for i in range(len(data.rows))
+                     if data.rows[i].row_type == 'data' and data.rows[i].row_key}
         for i in target_idx:
             row_entry = data.rows[i]
             rid = row_entry.data.get('id')
             if rid is None or rid == '':
                 skipped += 1
                 continue
-            row_entry.row_key = str(rid)
+            new_key = str(rid)
+            if new_key == row_entry.row_key:
+                continue  # 已一致
+            if new_key in used_keys:
+                conflicts += 1
+                continue
+            used_keys.discard(row_entry.row_key)  # 释放本行旧键
+            used_keys.add(new_key)
+            row_entry.row_key = new_key
             row_entry._dirty = True
             synced += 1
 
         if synced == 0:
-            QMessageBox.information(self, "提示",
-                                    "没有可同步的行（所选数据行均缺少 id 字段）。")
+            msg = "没有可同步的行（所选数据行均缺少 id 字段）。"
+            if conflicts:
+                msg = f"有 {conflicts} 行因与现有行键重复被跳过。" + msg
+            QMessageBox.information(self, "提示", msg)
             return
 
         data.modified = True
+        data.non_undoable_modified = True  # 批量同步不可撤销
         model._rebuild_duplicates()
         model.safe_notify_reset()
         self._update_tab_title()
@@ -5153,6 +5425,8 @@ class MainWindow(QMainWindow):
         msg = f"已同步 {synced} 行的行键与 id"
         if skipped:
             msg += f"（{skipped} 行缺少 id 已跳过）"
+        if conflicts:
+            msg += f"（{conflicts} 行与现有行键重复已跳过）"
         self._status_label.setText(msg)
 
     # ---- 修改 / 设置行键（右键菜单）----
@@ -5329,16 +5603,17 @@ class MainWindow(QMainWindow):
         # 使用 selectedIndexes() 而非 selectedRows()，以兼容 SelectItems 模式
         sel_indexes = view.selectionModel().selectedIndexes()
 
-        # 收集需要注释的所有数据行索引（去重，映射到源模型）
+        # 收集需要注释的所有数据行（去重）。选中行号是逻辑行（含表头注释），
+        # 必须经 _resolve_row 换算为 data.rows 下标；此前直接索引导致
+        # 带表头注释的表整批错位/越界（BUG-01）
         rows_to_comment = set()
         for idx in sel_indexes:
             src_idx = proxy.mapToSource(idx) if proxy else idx
-            row = src_idx.row()
-            if row < 0 or row >= len(data.rows):
+            row_type, real_idx = model._resolve_row(src_idx.row())
+            if row_type != model.ROW_DATA or real_idx is None:
                 continue
-            entry = data.rows[row]
-            if entry.row_type == 'data':
-                rows_to_comment.add(row)
+            if 0 <= real_idx < len(data.rows) and data.rows[real_idx].row_type == 'data':
+                rows_to_comment.add(real_idx)
 
         if not rows_to_comment:
             QMessageBox.information(self, "提示", "选中的行中没有数据行可注释。")
@@ -5352,12 +5627,11 @@ class MainWindow(QMainWindow):
             comment_text = self._row_data_to_comment_text(entry.data, data.field_names)
             data.rows[row] = RowEntry(row_type='comment', comment_text=comment_text, row_key=entry.row_key)
 
-        # 通知视图刷新受影响的区域
+        # 通知视图刷新受影响的区域（dataChanged 需要逻辑行号，加回表头偏移）
         model._rebuild_duplicates()
-        min_row = min(rows_to_comment)
-        max_row = max(rows_to_comment)
-        top_left = model.index(min_row, 0)
-        bottom_right = model.index(max_row, model.columnCount() - 1)
+        hc = model._header_count
+        top_left = model.index(min(rows_to_comment) + hc, 0)
+        bottom_right = model.index(max(rows_to_comment) + hc, model.columnCount() - 1)
         model.dataChanged.emit(top_left, bottom_right)
 
         data.modified = True
@@ -5379,22 +5653,22 @@ class MainWindow(QMainWindow):
         # 使用 selectedIndexes() 而非 selectedRows()，以兼容 SelectItems 模式
         sel_indexes = view.selectionModel().selectedIndexes()
 
-        # 收集需要取消注释的行索引（去重）
+        # 收集需要取消注释的行（去重）。逻辑行经 _resolve_row 换算（BUG-01 同源）
         rows_to_uncomment = set()
         for idx in sel_indexes:
             src_idx = proxy.mapToSource(idx) if proxy else idx
-            row = src_idx.row()
-            if row < 0 or row >= len(data.rows):
+            row_type, real_idx = model._resolve_row(src_idx.row())
+            if row_type != model.ROW_INLINE_COMMENT or real_idx is None:
                 continue
-            entry = data.rows[row]
-            if entry.row_type == 'comment':
-                rows_to_uncomment.add(row)
+            if 0 <= real_idx < len(data.rows) and data.rows[real_idx].row_type == 'comment':
+                rows_to_uncomment.add(real_idx)
 
         if not rows_to_uncomment:
             QMessageBox.information(self, "提示", "选中的行中没有注释行可取消注释。")
             return
 
         restored_count = 0
+        skipped = 0
         # 从后往前处理
         for row in sorted(rows_to_uncomment, reverse=True):
             entry = data.rows[row]
@@ -5404,6 +5678,7 @@ class MainWindow(QMainWindow):
             if '_comment_text' in parsed:
                 # 仅当纯文本注释也只含 _comment_text 键时跳过
                 if len(parsed) == 1:
+                    skipped += 1
                     continue
 
             # 记录撤销：保存取消注释前的注释行状态
@@ -5412,25 +5687,27 @@ class MainWindow(QMainWindow):
             restored_count += 1
 
         if restored_count == 0:
-            QMessageBox.information(self, "提示",
-                                    "选中的注释行无法解析为数据行。\n"
-                                    "请确保注释格式为 -- {key=val, ...}")
+            msg = ("选中的注释行无法解析为数据行。\n"
+                   "请确保注释格式为 -- {key=val, ...}")
+            if skipped:
+                msg = f"共 {len(rows_to_uncomment)} 行，其中 {skipped} 行无法解析。\n" + msg
+            QMessageBox.information(self, "提示", msg)
             return
 
-        # 通知视图刷新
+        # 通知视图刷新（dataChanged 需要逻辑行号，加回表头偏移）
         model._rebuild_duplicates()
-        min_row = min(rows_to_uncomment)
-        max_row = max(rows_to_uncomment)
-        top_left = model.index(min_row, 0)
-        bottom_right = model.index(max_row, model.columnCount() - 1)
+        hc = model._header_count
+        top_left = model.index(min(rows_to_uncomment) + hc, 0)
+        bottom_right = model.index(max(rows_to_uncomment) + hc, model.columnCount() - 1)
         model.dataChanged.emit(top_left, bottom_right)
 
         data.modified = True
         self._update_tab_title()
         self._update_statusbar()
-        self._status_label.setText(
-            f"已取消注释 {restored_count} 行数据"
-        )
+        msg = f"已取消注释 {restored_count} 行数据"
+        if skipped:
+            msg += f"（{skipped} 行纯文本注释无法解析已跳过）"
+        self._status_label.setText(msg)
 
     # ---- 批量添加行 ----
     def _add_rows_batch(self):
@@ -5472,13 +5749,16 @@ class MainWindow(QMainWindow):
         if pos is None:
             sel = view.selectionModel().selectedIndexes()
             if sel:
-                # 找到选中区域最后一行，插在其后
-                pos = max(idx.row() for idx in sel) + 1
+                # 选中区域最后一行：视图行号必须先映射回源模型逻辑行号，
+                # 此前直接用 proxy 行号当逻辑行，筛选状态下插错位置（BUG-06）
+                pos = max(proxy.mapToSource(idx).row() for idx in sel) + 1
             else:
-                pos = len(model.table_data.rows)
+                # 追加到数据区末尾（return 行之前的逻辑行号）。
+                # 此前误用 data 行数当逻辑行号，带表头注释的表会插到表首（BUG-06）
+                pos = model.rowCount() - 1 if model._has_return else model.rowCount()
 
-        for i in range(count):
-            model.add_data_row(pos + i)
+        # 单次 begin/end 信号批量插入（复用既有 add_data_rows_batch，PERF-05）
+        model.add_data_rows_batch(count, pos)
         self._update_statusbar()
         self._status_label.setText(f"已添加 {count} 行")
 
@@ -5524,6 +5804,7 @@ class MainWindow(QMainWindow):
                 row._dirty = True
 
         data.modified = True
+        data.non_undoable_modified = True  # 加列不可撤销（set_data 还会清空撤销栈）
         model.set_data(data)  # 刷新模型以更新列头
         self._update_tab_title()
         self._update_statusbar()
@@ -5564,12 +5845,11 @@ class MainWindow(QMainWindow):
         if not self._detail_panel.isVisible():
             return
 
-        sel = view.selectionModel().selectedIndexes()
-        if not sel:
+        # 取当前焦点单元格（此前取 selectedIndexes()[0]，多选时显示的可能
+        # 不是用户聚焦的格子，BUG-15）
+        idx = view.currentIndex()
+        if not idx.isValid():
             return
-
-        # 取第一个选中单元格
-        idx = sel[0]
         proxy = view.model()
         if isinstance(proxy, QSortFilterProxyModel):
             model = proxy.sourceModel()
@@ -5598,11 +5878,21 @@ class MainWindow(QMainWindow):
         self._find_dialog.activateWindow()
 
     def perform_search(self, text: str):
-        """执行查找"""
+        """执行查找（读取查找对话框选项，BUG-14）"""
         proxy = self._get_proxy()
         if not proxy:
             return
-        proxy.set_search(text)
+        if self._find_dialog is not None:
+            case_sensitive, all_columns = self._find_dialog.get_options()
+        else:
+            case_sensitive, all_columns = False, True
+        col = 1
+        view = self._get_view()
+        if view is not None and not all_columns:
+            cur = view.currentIndex()
+            if cur.isValid() and cur.column() > 0:
+                col = cur.column()
+        proxy.set_search(text, case_sensitive, all_columns, col)
 
     def search_next(self):
         """查找下一个"""
@@ -5764,6 +6054,7 @@ class MainWindow(QMainWindow):
 
         # 4) 标记修改并重建模型
         data.modified = True
+        data.non_undoable_modified = True  # 删列不可撤销（确认框已提示）
         model.set_data(data)          # 会重建列头、重复值集合，并重置视图
         view._rebuild_frozen()        # 用新的冻结索引重建浮层
 
@@ -5798,9 +6089,7 @@ class MainWindow(QMainWindow):
         if not proxy:
             return
         proxy.set_filter(column, text, mode)
-        self._filter_status.setText(
-            f"筛选: 列 {column} {mode} \"{text}\""
-        )
+        self._sync_filter_status()
         self._status_label.setText(f"已应用筛选: {mode} \"{text}\"")
 
     def _clear_filter(self, column: int = -1):
@@ -5920,12 +6209,14 @@ class MainWindow(QMainWindow):
         has_comment = False
         for idx in sel_indexes:
             src_idx = proxy.mapToSource(idx) if proxy else idx
-            row = src_idx.row()
-            if row < 0 or row >= len(data.rows):
+            row_type, real_idx = model._resolve_row(src_idx.row())
+            if row_type in (None, model.ROW_HEADER_COMMENT, model.ROW_RETURN):
+                continue  # 结构行不参与判断（此前直接索引 data.rows 导致错位，BUG-01）
+            if real_idx is None or not (0 <= real_idx < len(data.rows)):
                 continue
-            if data.rows[row].row_type == 'data':
+            if data.rows[real_idx].row_type == 'data':
                 has_data = True
-            else:
+            elif data.rows[real_idx].row_type == 'comment':
                 has_comment = True
             if has_data and has_comment:
                 break
@@ -5935,18 +6226,26 @@ class MainWindow(QMainWindow):
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
-                if url.toLocalFile().endswith('.lua'):
+                if url.toLocalFile().lower().endswith('.lua'):
                     event.acceptProposedAction()
                     return
         event.ignore()
 
     def dropEvent(self, event: QDropEvent):
-        for url in event.mimeData().urls():
-            file_path = url.toLocalFile()
-            if file_path.endswith('.lua'):
-                self._open_file_path(file_path)
-                return
+        # 后缀不区分大小写（.LUA 之前被拒）；一次拖入多个文件全部排队打开，
+        # 此前只打开第一个（BUG-29）
+        paths = [u.toLocalFile() for u in event.mimeData().urls()
+                 if u.toLocalFile().lower().endswith('.lua')]
+        if paths:
+            event.acceptProposedAction()
+            self._open_files(paths)
+            return
         event.ignore()
+
+    def _open_files(self, paths):
+        """依次打开多个文件（后台加载互斥，排队处理，BUG-29）"""
+        self._pending_opens.extend(paths)
+        self._drain_pending_opens()
 
     # ---- 关闭事件 ----
     def closeEvent(self, event):
@@ -5984,7 +6283,11 @@ class MainWindow(QMainWindow):
         data = self._get_data()
         proxy = self._get_proxy()
         if data:
-            total = len(data.rows)
+            # 行数口径与 rowCount 一致：含头注释与 return 行（BUG-16：
+            # 此前只统计 data.rows，界面显示的行数比状态栏多）
+            hc = len(data.header_comments)
+            has_ret = bool(data.return_var)
+            total = hc + len(data.rows) + (1 if has_ret else 0)
             data_rows = sum(1 for r in data.rows if r.row_type == 'data')
             comment_rows = total - data_rows
 

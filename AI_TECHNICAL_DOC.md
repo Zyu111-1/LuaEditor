@@ -590,7 +590,7 @@ DEFAULT_COLORS = [
 | `Tab` | Move to next column (wrap to next row) |
 | `Shift+Tab` | Move to previous column (wrap to previous row) |
 | Any printable char | Start editing with that character |
-| `Backspace`/`Delete` | Clear cell content without entering edit mode |
+| `Backspace` | Clear cell content without entering edit mode (Delete is bound to 删除当前行 menu action, which takes priority) |
 | `Ctrl+Click` | Non-contiguous multi-select |
 | `Shift+Click` | Range select |
 
