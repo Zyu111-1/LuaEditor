@@ -37,6 +37,82 @@ from PySide6.QtGui import (
 )
 
 # ============================================================================
+# 主题（所有颜色/圆角/度量集中在此，调整整体视觉只改这一类）
+# ============================================================================
+
+class Theme:
+    """应用统一配色。语义色（注释绿/紫、重复值红）保持辨识度，其余为现代浅色主题。"""
+
+    # ---- 基础 ----
+    BG              = '#f3f4f6'   # 窗口底色
+    SURFACE         = '#ffffff'   # 卡片/表格底色
+    SURFACE_ALT     = '#f8f9fb'   # 交替/次级底色
+    BORDER          = '#e2e5e9'   # 普通边框
+    BORDER_STRONG   = '#c9cdd4'   # 强边框/分隔线
+    TEXT            = '#1f2937'   # 主文字
+    TEXT_MUTED      = '#6b7280'   # 次级文字
+    TEXT_FAINT      = '#9ca3af'   # 提示文字
+
+    # ---- 主题色 ----
+    ACCENT          = '#4f7df0'
+    ACCENT_HOVER    = '#3d6ae0'
+    ACCENT_PRESS    = '#3358c8'
+    ACCENT_SOFT     = '#e8effd'   # 浅强调（当前行/列高亮）
+    FOCUS           = '#3a7fc0'
+
+    # ---- 表格 ----
+    GRID            = '#edf0f3'
+    HEADER_BG       = '#f7f8fa'
+    HEADER_TEXT     = '#374151'
+    ROW_ALT         = '#fafbfd'   # 斑马纹
+    ROW_NUM         = '#8a94a6'   # 行号
+    ROW_STRUCT      = '#9aa3c7'   # 结构行行号（蓝灰）
+    SELECTION       = '#dbe7fe'   # 普通选中
+    SEL_ROW         = '#c6dcfc'   # 整行选中
+    SEL_COL         = '#ffd9b3'   # 整列选中
+    SEL_CROSS       = '#ffd24d'   # 行列交叉点
+    CROSS_BORDER    = '#e69500'
+    MARKER          = '#4a86e8'   # 行号列左侧标记条
+
+    # ---- 重复值高亮 ----
+    DUP_BG          = '#ffe8e0'
+    DUP_TEXT        = '#c0392b'
+    DUP_MARKER      = '#e8836b'
+
+    # ---- 注释 / 结构行（语义色）----
+    HDR_CMT_BG      = '#f0f6ed'   # 头注释底
+    HDR_CMT_TEXT    = '#166534'   # 头注释深绿
+    CMT_BG          = '#f7f7f2'   # 内联注释底
+    CMT_TEXT        = '#64748b'   # 内联注释灰
+    RET_BG          = '#f6f1fb'   # return 行底
+    RET_TEXT        = '#7c3aed'   # return 紫
+
+    # ---- 填充柄 ----
+    FILL            = '#2980b9'
+    FILL_HOVER      = '#42A5F5'
+    FILL_BORDER     = '#1a5276'
+    FILL_HOVER_BORDER = '#1565C0'
+
+    # ---- 冻结 / 分隔 ----
+    FREEZE_BORDER   = '#b9c2cd'
+    SEP_LINE        = '#d9dde3'
+
+    # ---- 面板 ----
+    PANEL_BG        = '#f7f8f9'
+    PANEL_HEADER    = '#eceef1'
+
+    # ---- 按钮 ----
+    BTN_BG          = '#ffffff'
+    BTN_HOVER       = '#eef2f8'
+    BTN_PRESS       = '#dfe7f2'
+
+    # ---- 欢迎页辅助色 ----
+    SUCCESS         = '#34a853'
+    SUCCESS_HOVER   = '#2d9448'
+    SUCCESS_PRESS   = '#27823d'
+
+
+# ============================================================================
 # 数据模型
 # ============================================================================
 
@@ -950,8 +1026,8 @@ class LuaTableModel(QAbstractTableModel):
                 return Qt.AlignCenter
             if role == Qt.ForegroundRole:
                 if row_type in (self.ROW_HEADER_COMMENT, self.ROW_RETURN):
-                    return QColor('#9999bb')  # 蓝灰色，区分文件结构行
-                return QColor('#888888')
+                    return QColor(Theme.ROW_STRUCT)  # 蓝灰色，区分文件结构行
+                return QColor(Theme.ROW_NUM)
             if role == Qt.FontRole:
                 font = LuaTableModel._get_row_font()
                 if row_type in (self.ROW_HEADER_COMMENT, self.ROW_RETURN):
@@ -968,7 +1044,7 @@ class LuaTableModel(QAbstractTableModel):
             if role == Qt.DisplayRole:
                 return ''
             if role == Qt.ForegroundRole:
-                return QColor('#008000')  # 绿色（Lua 注释色）
+                return QColor(Theme.HDR_CMT_TEXT)  # 绿色（Lua 注释色）
             if role == Qt.FontRole:
                 font = LuaTableModel._get_row_font()
                 font.setItalic(True)
@@ -987,7 +1063,7 @@ class LuaTableModel(QAbstractTableModel):
             if role == Qt.DisplayRole:
                 return ''
             if role == Qt.ForegroundRole:
-                return QColor('#800080')  # 紫色（关键字色）
+                return QColor(Theme.RET_TEXT)  # 紫色（关键字色）
             if role == Qt.FontRole:
                 font = LuaTableModel._get_row_font()
                 font.setItalic(True)
@@ -1019,7 +1095,7 @@ class LuaTableModel(QAbstractTableModel):
             if role == Qt.TextAlignmentRole:
                 return Qt.AlignLeft | Qt.AlignVCenter
             if role == Qt.ForegroundRole:
-                return QColor('#008000')
+                return QColor(Theme.CMT_TEXT)
             return None
 
         # 数据行
@@ -1631,38 +1707,38 @@ class LuaTableDelegate(QStyledItemDelegate):
 
             # 背景色：根据行类型区分，叠加选中行/列高亮
             if is_intersect:
-                painter.fillRect(option.rect, QColor('#ffd24d'))   # 交叉点：金色强调
+                painter.fillRect(option.rect, QColor(Theme.SEL_CROSS))   # 交叉点：金色强调
             elif sel_row:
-                painter.fillRect(option.rect, QColor('#bfe3ff'))   # 整行选中：蓝
+                painter.fillRect(option.rect, QColor(Theme.SEL_ROW))   # 整行选中：蓝
             elif sel_col:
-                painter.fillRect(option.rect, QColor('#ffd9b3'))   # 整列选中：橙
+                painter.fillRect(option.rect, QColor(Theme.SEL_COL))   # 整列选中：橙
             elif is_selected:
-                painter.fillRect(option.rect, QColor('#3a4a5a'))
+                painter.fillRect(option.rect, QColor(Theme.SELECTION))
             elif is_highlighted:
-                painter.fillRect(option.rect, QColor('#d8dfeb'))
+                painter.fillRect(option.rect, QColor(Theme.ACCENT_SOFT))
             elif is_structural and src._resolve_row(row)[0] == LuaTableModel.ROW_RETURN:
-                painter.fillRect(option.rect, QColor('#f0e8f5'))  # return 行淡紫色背景
+                painter.fillRect(option.rect, QColor(Theme.RET_BG))  # return 行淡紫色背景
             elif is_structural:
-                painter.fillRect(option.rect, QColor('#f5f5ee'))   # 头注释行浅色背景
+                painter.fillRect(option.rect, QColor(Theme.HDR_CMT_BG))   # 头注释行浅色背景
             else:
-                painter.fillRect(option.rect, QColor('#f0f0e8'))  # 内联注释行
+                painter.fillRect(option.rect, QColor(Theme.CMT_BG))  # 内联注释行
 
             # 选中/高亮行的行号列左侧标记条
             if col == 0 and (is_selected or is_highlighted):
                 marker_rect = QRect(option.rect.left(), option.rect.top(),
                                     4, option.rect.height())
-                painter.fillRect(marker_rect, QColor('#4a86e8'))
+                painter.fillRect(marker_rect, QColor(Theme.MARKER))
 
             # 绘制文本（仅第一列有效数据列）
             if col == 1:
                 text = src.data(src_index, Qt.UserRole) or ''
                 # 根据行类型设置文字颜色
                 if is_structural and src._resolve_row(row)[0] == LuaTableModel.ROW_RETURN:
-                    painter.setPen(QColor('#800080'))  # return 紫色
+                    painter.setPen(QColor(Theme.RET_TEXT))  # return 紫色
                 elif is_structural:
-                    painter.setPen(QColor('#006600'))  # 头注释深绿
+                    painter.setPen(QColor(Theme.HDR_CMT_TEXT))  # 头注释深绿
                 else:
-                    painter.setPen(QColor('#666666'))  # 内联注释灰
+                    painter.setPen(QColor(Theme.CMT_TEXT))  # 内联注释灰
                 font = QFont(option.font)
                 font.setItalic(True)
                 font.setPointSize(font.pointSize() - 1)
@@ -1676,7 +1752,7 @@ class LuaTableDelegate(QStyledItemDelegate):
                 painter.drawText(rect, Qt.AlignLeft | Qt.AlignVCenter, elided)
 
             # 绘制底部分隔线
-            painter.setPen(QColor('#d0d0c8'))
+            painter.setPen(QColor(Theme.SEP_LINE))
             painter.drawLine(
                 option.rect.bottomLeft(), option.rect.bottomRight()
             )
@@ -1720,27 +1796,27 @@ class LuaTableDelegate(QStyledItemDelegate):
 
         # ---- 背景色 ----
         if is_intersect:
-            painter.fillRect(option.rect, QColor('#ffd24d'))   # 交叉点：金色强强调
+            painter.fillRect(option.rect, QColor(Theme.SEL_CROSS))   # 交叉点：金色强强调
         elif is_sel_row:
-            painter.fillRect(option.rect, QColor('#bfe3ff'))   # 整行选中：蓝
+            painter.fillRect(option.rect, QColor(Theme.SEL_ROW))   # 整行选中：蓝
         elif is_sel_col:
-            painter.fillRect(option.rect, QColor('#ffd9b3'))   # 整列选中：橙
+            painter.fillRect(option.rect, QColor(Theme.SEL_COL))   # 整列选中：橙
         elif is_selected:
-            painter.fillRect(option.rect, QColor('#a8d4f0'))   # 普通块选中：浅蓝
+            painter.fillRect(option.rect, QColor(Theme.SELECTION))   # 普通块选中：浅蓝
         elif is_dup:
-            painter.fillRect(option.rect, QColor('#ffe8e0'))
+            painter.fillRect(option.rect, QColor(Theme.DUP_BG))
         elif is_highlighted:
-            painter.fillRect(option.rect, QColor('#d8eafc'))
+            painter.fillRect(option.rect, QColor(Theme.ACCENT_SOFT))
         elif row % 2 == 0:
-            painter.fillRect(option.rect, QColor('#ffffff'))
+            painter.fillRect(option.rect, QColor(Theme.SURFACE))
         else:
-            painter.fillRect(option.rect, QColor('#f8f8fa'))
+            painter.fillRect(option.rect, QColor(Theme.ROW_ALT))
 
         # 行号列：选中/高亮行左侧标记条
         if col == 0 and (is_selected or is_hl_row):
             marker_rect = QRect(option.rect.left(), option.rect.top(),
                                 4, option.rect.height())
-            painter.fillRect(marker_rect, QColor('#4a86e8'))
+            painter.fillRect(marker_rect, QColor(Theme.MARKER))
 
         # 绘制文本（省略长文本）
         if col > 0:
@@ -1751,22 +1827,22 @@ class LuaTableDelegate(QStyledItemDelegate):
 
             # 重复值用橙红色文字 + 底部标记线
             if is_dup:
-                painter.setPen(QColor('#c0392b'))
+                painter.setPen(QColor(Theme.DUP_TEXT))
                 # 底部橙色标记线
                 line_y = option.rect.bottom() - 1
                 painter.fillRect(
                     QRect(option.rect.left() + 4, line_y,
                           option.rect.width() - 8, 1),
-                    QColor('#e8836b')
+                    QColor(Theme.DUP_MARKER)
                 )
                 # 左侧小标记条
                 dup_marker = QRect(option.rect.left(), option.rect.top(),
                                    3, option.rect.height())
-                painter.fillRect(dup_marker, QColor('#e8836b'))
+                painter.fillRect(dup_marker, QColor(Theme.DUP_MARKER))
             elif len(text) > self.MAX_CHARS:
-                painter.setPen(QColor('#202020'))
+                painter.setPen(QColor(Theme.TEXT))
             else:
-                painter.setPen(QColor('#202020'))
+                painter.setPen(QColor(Theme.TEXT))
 
             if '\n' in text or '\r' in text:
                 # 文本含真实换行符（如 Lua 里的 \n 经解析所得）：
@@ -1789,7 +1865,7 @@ class LuaTableDelegate(QStyledItemDelegate):
         # 交叉点（整行且整列同时选中）单元格边框强调
         if col > 0 and is_intersect:
             painter.save()
-            painter.setPen(QPen(QColor('#e69500'), 2))
+            painter.setPen(QPen(QColor(Theme.CROSS_BORDER), 2))
             painter.drawRect(option.rect.adjusted(1, 1, -1, -1))
             painter.restore()
 
@@ -1798,7 +1874,7 @@ class LuaTableDelegate(QStyledItemDelegate):
         # ---- 当前格焦点框（独立于单元格绘制，在最上层） ----
         if col > 0 and (option.state & QStyle.State_HasFocus):
             painter.save()
-            painter.setPen(QPen(QColor('#3a7fc0'), 2))
+            painter.setPen(QPen(QColor(Theme.FOCUS), 2))
             r = option.rect.adjusted(1, 1, -1, -1)
             painter.drawRect(r)
             painter.restore()
@@ -1833,11 +1909,11 @@ class LuaTableDelegate(QStyledItemDelegate):
 
             hanging = getattr(view, '_fill_hovering', False)
             if hanging:
-                painter.setPen(QPen(QColor('#1565C0'), 2))
-                painter.setBrush(QColor('#42A5F5'))
+                painter.setPen(QPen(QColor(Theme.FILL_HOVER_BORDER), 2))
+                painter.setBrush(QColor(Theme.FILL_HOVER))
             else:
-                painter.setPen(QPen(QColor('#1a5276'), 1))
-                painter.setBrush(QColor('#2980b9'))
+                painter.setPen(QPen(QColor(Theme.FILL_BORDER), 1))
+                painter.setBrush(QColor(Theme.FILL))
 
             sz = 7
             cr = QRect(
@@ -2211,9 +2287,9 @@ class LuaTableView(QTableView):
             ov.setShowGrid(self.showGrid())
             ov.verticalHeader().setDefaultSectionSize(
                 self.verticalHeader().defaultSectionSize())
-            border = ("border-right: 2px solid #b0b8c0;"
-                      if side == 'left' else "border-left: 2px solid #b0b8c0;")
-            ov.setStyleSheet(f"QTableView {{ border: none; background: #ffffff; {border} }}")
+            border = (f"border-right: 2px solid {Theme.FREEZE_BORDER};"
+                      if side == 'left' else f"border-left: 2px solid {Theme.FREEZE_BORDER};")
+            ov.setStyleSheet(f"QTableView {{ border: none; background: {Theme.SURFACE}; {border} }}")
 
             # 隐藏所有非本侧冻结列（冻结列按列号顺序自动紧挨显示）
             frozen_cols = {e['col'] for e in cols}
@@ -2527,12 +2603,12 @@ class LuaTableView(QTableView):
 
         if self._fill_hovering:
             # 悬停状态：醒目的蓝色，带边框光晕
-            painter.setPen(QPen(QColor('#1565C0'), 2))
-            painter.setBrush(QColor('#42A5F5'))
+            painter.setPen(QPen(QColor(Theme.FILL_HOVER_BORDER), 2))
+            painter.setBrush(QColor(Theme.FILL_HOVER))
         else:
             # 正常状态：深蓝色小方块
-            painter.setPen(QPen(QColor('#1a5276'), 1))
-            painter.setBrush(QColor('#2980b9'))
+            painter.setPen(QPen(QColor(Theme.FILL_BORDER), 1))
+            painter.setBrush(QColor(Theme.FILL))
 
         painter.drawRect(fr)
         painter.restore()
@@ -2585,7 +2661,7 @@ class FindDialog(QDialog):
 
         # 结果标签
         self.result_label = QLabel("")
-        self.result_label.setStyleSheet("color: #888; font-size: 12px;")
+        self.result_label.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-size: 12px;")
         layout.addWidget(self.result_label)
 
         # 按钮
@@ -2677,9 +2753,9 @@ class CellDetailPanel(QWidget):
         # 信息标签
         info_layout = QHBoxLayout()
         self.field_label = QLabel("字段: -")
-        self.field_label.setStyleSheet("font-weight: bold; color: #333;")
+        self.field_label.setStyleSheet(f"font-weight: bold; color: {Theme.TEXT};")
         self.row_label = QLabel("行号: -")
-        self.row_label.setStyleSheet("color: #666;")
+        self.row_label.setStyleSheet(f"color: {Theme.TEXT_MUTED};")
         info_layout.addWidget(self.field_label)
         info_layout.addSpacing(20)
         info_layout.addWidget(self.row_label)
@@ -2695,16 +2771,16 @@ class CellDetailPanel(QWidget):
         self.content_label = QLabel("")
         self.content_label.setWordWrap(True)
         self.content_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.content_label.setStyleSheet("""
-            QLabel {
-                background-color: #fafafa;
-                border: 1px solid #ddd;
-                border-radius: 3px;
+        self.content_label.setStyleSheet(f"""
+            QLabel {{
+                background-color: {Theme.SURFACE_ALT};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 5px;
                 padding: 6px;
                 font-family: 'Consolas', 'Courier New', monospace;
                 font-size: 13px;
-                color: #202020;
-            }
+                color: {Theme.TEXT};
+            }}
         """)
         self.content_label.setMinimumHeight(40)
 
@@ -2714,11 +2790,11 @@ class CellDetailPanel(QWidget):
         scroll.setFrameShape(QFrame.NoFrame)
         layout.addWidget(scroll)
 
-        self.setStyleSheet("""
-            CellDetailPanel {
-                background-color: #f5f5f0;
-                border-bottom: 2px solid #ccc;
-            }
+        self.setStyleSheet(f"""
+            CellDetailPanel {{
+                background-color: {Theme.PANEL_HEADER};
+                border-bottom: 1px solid {Theme.BORDER_STRONG};
+            }}
         """)
 
     def show_detail(self, field_name: str, row_num: int, content: str):
@@ -2757,12 +2833,12 @@ class WelcomeWidget(QWidget):
 
         # 标题
         title = QLabel("Lua Table Editor")
-        title.setStyleSheet("font-size: 28px; font-weight: bold; color: #333; margin-bottom: 10px;")
+        title.setStyleSheet(f"font-size: 28px; font-weight: bold; color: {Theme.TEXT}; margin-bottom: 10px;")
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
         subtitle = QLabel("游戏策划 Lua 配置表编辑工具")
-        subtitle.setStyleSheet("font-size: 14px; color: #888; margin-bottom: 30px;")
+        subtitle.setStyleSheet(f"font-size: 14px; color: {Theme.TEXT_MUTED}; margin-bottom: 30px;")
         subtitle.setAlignment(Qt.AlignCenter)
         layout.addWidget(subtitle)
 
@@ -2770,14 +2846,14 @@ class WelcomeWidget(QWidget):
         drop_zone = QLabel()
         drop_zone.setFixedSize(500, 150)
         drop_zone.setAlignment(Qt.AlignCenter)
-        drop_zone.setStyleSheet("""
-            QLabel {
-                border: 3px dashed #c0c0c0;
+        drop_zone.setStyleSheet(f"""
+            QLabel {{
+                border: 3px dashed {Theme.BORDER_STRONG};
                 border-radius: 12px;
-                background-color: #fafaf8;
-                color: #999;
+                background-color: {Theme.SURFACE_ALT};
+                color: {Theme.TEXT_FAINT};
                 font-size: 15px;
-            }
+            }}
         """)
         drop_zone.setText("📂  拖拽 .lua 文件到此处打开\n\n或使用下方按钮")
         layout.addWidget(drop_zone, alignment=Qt.AlignCenter)
@@ -2788,32 +2864,32 @@ class WelcomeWidget(QWidget):
 
         open_btn = QPushButton("📂  打开 Lua 文件")
         open_btn.setMinimumSize(160, 42)
-        open_btn.setStyleSheet("""
-            QPushButton {
+        open_btn.setStyleSheet(f"""
+            QPushButton {{
                 font-size: 14px;
-                background-color: #4a90d9;
+                background-color: {Theme.ACCENT};
                 color: white;
                 border: none;
-                border-radius: 6px;
-            }
-            QPushButton:hover { background-color: #3a7bc8; }
-            QPushButton:pressed { background-color: #2a6ab8; }
+                border-radius: 7px;
+            }}
+            QPushButton:hover {{ background-color: {Theme.ACCENT_HOVER}; }}
+            QPushButton:pressed {{ background-color: {Theme.ACCENT_PRESS}; }}
         """)
         open_btn.clicked.connect(lambda: self.open_requested.emit())
         btn_layout.addWidget(open_btn)
 
         new_btn = QPushButton("✨  新建空白表")
         new_btn.setMinimumSize(160, 42)
-        new_btn.setStyleSheet("""
-            QPushButton {
+        new_btn.setStyleSheet(f"""
+            QPushButton {{
                 font-size: 14px;
-                background-color: #5cb85c;
+                background-color: {Theme.SUCCESS};
                 color: white;
                 border: none;
-                border-radius: 6px;
-            }
-            QPushButton:hover { background-color: #4cae4c; }
-            QPushButton:pressed { background-color: #3c9e3c; }
+                border-radius: 7px;
+            }}
+            QPushButton:hover {{ background-color: {Theme.SUCCESS_HOVER}; }}
+            QPushButton:pressed {{ background-color: {Theme.SUCCESS_PRESS}; }}
         """)
         new_btn.clicked.connect(lambda: self.new_requested.emit())
         btn_layout.addWidget(new_btn)
@@ -2825,7 +2901,7 @@ class WelcomeWidget(QWidget):
             "💡 提示: Ctrl+O 打开文件 | Ctrl+N 新建 | 将 .lua 文件拖入窗口即可打开\n"
             "F1 查看完整使用帮助"
         )
-        tips.setStyleSheet("font-size: 12px; color: #aaa; margin-top: 20px;")
+        tips.setStyleSheet(f"font-size: 12px; color: {Theme.TEXT_FAINT}; margin-top: 20px;")
         tips.setAlignment(Qt.AlignCenter)
         layout.addWidget(tips)
 
@@ -2862,21 +2938,26 @@ class WorkspacePanel(QWidget):
 
         # ---- 标题栏 ----
         header = QWidget()
-        header.setStyleSheet("background-color: #e8e8e0; border-bottom: 1px solid #ccc;")
+        header.setStyleSheet(
+            f"background-color: {Theme.PANEL_HEADER}; border-bottom: 1px solid {Theme.BORDER_STRONG};")
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(8, 4, 4, 4)
+        header_layout.setContentsMargins(8, 5, 5, 5)
 
         title = QLabel("📁 工作区")
-        title.setStyleSheet("font-weight: bold; font-size: 13px; border: none;")
+        title.setStyleSheet(f"font-weight: bold; font-size: 13px; border: none; color: {Theme.TEXT};")
         header_layout.addWidget(title)
         header_layout.addStretch()
 
         add_btn = QPushButton("＋")
         add_btn.setFixedSize(24, 24)
         add_btn.setToolTip("添加文件夹")
-        add_btn.setStyleSheet("""
-            QPushButton { border: 1px solid #ccc; border-radius: 3px; background: #fff; font-weight: bold; }
-            QPushButton:hover { background: #e0e8f0; }
+        add_btn.setStyleSheet(f"""
+            QPushButton {{
+                border: 1px solid {Theme.BORDER_STRONG}; border-radius: 5px;
+                background: {Theme.BTN_BG}; font-weight: bold; color: {Theme.TEXT};
+            }}
+            QPushButton:hover {{ background: {Theme.BTN_HOVER}; border-color: {Theme.ACCENT}; }}
+            QPushButton:pressed {{ background: {Theme.BTN_PRESS}; }}
         """)
         add_btn.clicked.connect(self._add_folder)
         header_layout.addWidget(add_btn)
@@ -2887,17 +2968,19 @@ class WorkspacePanel(QWidget):
         self._search_bar = QLineEdit()
         self._search_bar.setPlaceholderText("🔍 搜索文件名...")
         self._search_bar.setClearButtonEnabled(True)
-        self._search_bar.setStyleSheet("""
-            QLineEdit {
+        self._search_bar.setStyleSheet(f"""
+            QLineEdit {{
                 border: none;
-                border-bottom: 1px solid #d0d0c8;
-                padding: 4px 8px;
+                border-bottom: 1px solid {Theme.BORDER};
+                padding: 5px 10px;
                 font-size: 12px;
-                background-color: #fafaf8;
-            }
-            QLineEdit:focus {
-                border-bottom: 2px solid #4a90d9;
-            }
+                background-color: {Theme.SURFACE_ALT};
+                color: {Theme.TEXT};
+            }}
+            QLineEdit:focus {{
+                border-bottom: 2px solid {Theme.ACCENT};
+                background-color: {Theme.SURFACE};
+            }}
         """)
         self._search_bar.textChanged.connect(self._filter_tree)
         layout.addWidget(self._search_bar)
@@ -2908,22 +2991,23 @@ class WorkspacePanel(QWidget):
         self._tree.setIndentation(16)
         self._tree.setAnimated(True)
         self._tree.setRootIsDecorated(True)
-        self._tree.setStyleSheet("""
-            QTreeWidget {
-                background-color: #f8f8f4;
+        self._tree.setStyleSheet(f"""
+            QTreeWidget {{
+                background-color: {Theme.PANEL_BG};
                 border: none;
                 font-size: 13px;
-            }
-            QTreeWidget::item {
-                padding: 3px 4px;
-            }
-            QTreeWidget::item:hover {
-                background-color: #e8eef4;
-            }
-            QTreeWidget::item:selected {
-                background-color: #d0dce8;
-                color: #000;
-            }
+            }}
+            QTreeWidget::item {{
+                padding: 4px 6px;
+                border-radius: 4px;
+            }}
+            QTreeWidget::item:hover {{
+                background-color: {Theme.ACCENT_SOFT};
+            }}
+            QTreeWidget::item:selected {{
+                background-color: {Theme.SELECTION};
+                color: {Theme.TEXT};
+            }}
         """)
         self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -2963,7 +3047,7 @@ class WorkspacePanel(QWidget):
             sep = QTreeWidgetItem()
             sep.setFlags(Qt.NoItemFlags)
             sep.setSizeHint(0, QSize(0, 5))
-            sep.setBackground(0, QBrush(QColor("#b0b0a8")))
+            sep.setBackground(0, QBrush(QColor(Theme.BORDER_STRONG)))
             self._tree.addTopLevelItem(sep)
 
         # ---- 工作区根节点 ----
@@ -3174,7 +3258,7 @@ class WorkspacePanel(QWidget):
         dlg_layout = QVBoxLayout(dialog)
 
         hint_label = QLabel(f"文件: {fname}")
-        hint_label.setStyleSheet("font-size: 11px; color: #666; padding: 4px 0;")
+        hint_label.setStyleSheet(f"font-size: 11px; color: {Theme.TEXT_MUTED}; padding: 4px 0;")
         dlg_layout.addWidget(hint_label)
 
         text_edit = QTextEdit()
@@ -3357,7 +3441,7 @@ class HelpDialog(QDialog):
         layout = QVBoxLayout(self)
 
         tab_widget = QTabWidget()
-        tab_widget.setStyleSheet("QTabWidget::pane { border: 1px solid #ccc; }")
+        tab_widget.setStyleSheet(f"QTabWidget::pane {{ border: 1px solid {Theme.BORDER_STRONG}; border-radius: 6px; }}")
 
         # ---- 标签页1: 快速入门 ----
         quick_tab = QTextBrowser()
@@ -3616,12 +3700,12 @@ class AboutDialog(QDialog):
         layout.setAlignment(Qt.AlignCenter)
 
         title = QLabel("Lua Table Editor")
-        title.setStyleSheet("font-size: 22px; font-weight: bold; color: #333;")
+        title.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {Theme.TEXT};")
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
         ver = QLabel("版本 1.0")
-        ver.setStyleSheet("font-size: 13px; color: #888;")
+        ver.setStyleSheet(f"font-size: 13px; color: {Theme.TEXT_MUTED};")
         ver.setAlignment(Qt.AlignCenter)
         layout.addWidget(ver)
 
@@ -3635,7 +3719,7 @@ class AboutDialog(QDialog):
             "• 拖拽打开、快捷键操作\n"
             "• 支持 [key]={value} 等多种 Lua 格式"
         )
-        desc.setStyleSheet("font-size: 13px; color: #555; line-height: 1.6;")
+        desc.setStyleSheet(f"font-size: 13px; color: {Theme.TEXT_MUTED}; line-height: 1.6;")
         desc.setAlignment(Qt.AlignCenter)
         layout.addWidget(desc)
 
@@ -3823,11 +3907,21 @@ class MainWindow(QMainWindow):
         self._toolbar = QToolBar("工具栏")
         self._toolbar.setMovable(False)
         self._toolbar.setIconSize(QSize(20, 20))
-        self._toolbar.setStyleSheet("""
-            QToolBar { spacing: 4px; padding: 4px 8px; background: #e8e8e0; border-bottom: 1px solid #ccc; }
-            QToolButton { padding: 5px 12px; border: 1px solid #ccc; border-radius: 3px; background: #fff; }
-            QToolButton:hover { background: #e0e8f0; border-color: #aaa; }
-            QToolButton:pressed { background: #c8d0d8; }
+        self._toolbar.setStyleSheet(f"""
+            QToolBar {{
+                spacing: 6px; padding: 6px 10px;
+                background: {Theme.PANEL_HEADER};
+                border-bottom: 1px solid {Theme.BORDER_STRONG};
+            }}
+            QToolButton {{
+                padding: 5px 14px;
+                border: 1px solid {Theme.BORDER_STRONG};
+                border-radius: 6px;
+                background: {Theme.BTN_BG};
+                color: {Theme.TEXT};
+            }}
+            QToolButton:hover {{ background: {Theme.BTN_HOVER}; border-color: {Theme.ACCENT}; }}
+            QToolButton:pressed {{ background: {Theme.BTN_PRESS}; }}
         """)
         self.addToolBar(self._toolbar)
 
@@ -3878,27 +3972,39 @@ class MainWindow(QMainWindow):
         self._tab_widget.setDocumentMode(True)
         self._tab_widget.tabCloseRequested.connect(self._on_tab_close_request)
         self._tab_widget.currentChanged.connect(self._on_tab_changed)
-        self._tab_widget.setStyleSheet("""
-            QTabWidget::pane {
+        self._tab_widget.setStyleSheet(f"""
+            QTabWidget::pane {{
                 border: none;
-                background: #f0f0f0;
-            }
-            QTabBar::tab {
-                padding: 6px 16px;
-                margin-right: 2px;
-                border: 1px solid #ccc;
+                background: {Theme.BG};
+            }}
+            QTabBar::tab {{
+                padding: 7px 18px;
+                margin-right: 3px;
+                border: 1px solid {Theme.BORDER};
                 border-bottom: none;
-                background: #e0e0d8;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
-            }
-            QTabBar::tab:selected {
-                background: #ffffff;
-                border-bottom: 2px solid #4a90d9;
-            }
-            QTabBar::tab:hover:!selected {
-                background: #ecece4;
-            }
+                background: {Theme.PANEL_HEADER};
+                color: {Theme.TEXT_MUTED};
+                border-top-left-radius: 7px;
+                border-top-right-radius: 7px;
+            }}
+            QTabBar::tab:selected {{
+                background: {Theme.SURFACE};
+                color: {Theme.TEXT};
+                border-color: {Theme.BORDER_STRONG};
+                border-bottom: 2px solid {Theme.ACCENT};
+                font-weight: bold;
+            }}
+            QTabBar::tab:hover:!selected {{
+                background: {Theme.SURFACE_ALT};
+                color: {Theme.TEXT};
+            }}
+            QTabBar::close-button {{
+                border-radius: 2px;
+                padding: 1px;
+            }}
+            QTabBar::close-button:hover {{
+                background: {Theme.DUP_BG};
+            }}
         """)
         tab_layout.addWidget(self._tab_widget)
 
@@ -3923,14 +4029,20 @@ class MainWindow(QMainWindow):
         self._splitter.setStretchFactor(1, 1)  # 主内容区拉伸
         self._splitter.setSizes([220, 980])
         self._splitter.setHandleWidth(3)
-        self._splitter.setStyleSheet("QSplitter::handle { background-color: #ccc; }")
+        self._splitter.setStyleSheet(f"QSplitter::handle {{ background-color: {Theme.BORDER_STRONG}; }}")
 
         layout.addWidget(self._splitter)
 
     # ---- 状态栏 ----
     def _setup_statusbar(self):
         self._statusbar = QStatusBar()
-        self._statusbar.setStyleSheet("QStatusBar { background: #e8e8e0; border-top: 1px solid #ccc; }")
+        self._statusbar.setStyleSheet(f"""
+            QStatusBar {{
+                background: {Theme.PANEL_HEADER};
+                border-top: 1px solid {Theme.BORDER_STRONG};
+                color: {Theme.TEXT_MUTED};
+            }}
+        """)
         self.setStatusBar(self._statusbar)
         self._status_label = QLabel("就绪")
         self._statusbar.addWidget(self._status_label)
@@ -3941,17 +4053,17 @@ class MainWindow(QMainWindow):
         self._loading_progress.setMaximumWidth(180)
         self._loading_progress.setMaximumHeight(18)
         self._loading_progress.setTextVisible(False)
-        self._loading_progress.setStyleSheet("""
-            QProgressBar {
-                border: 1px solid #c0c0c0;
-                border-radius: 3px;
-                background: #f0f0e8;
-            }
-            QProgressBar::chunk {
+        self._loading_progress.setStyleSheet(f"""
+            QProgressBar {{
+                border: 1px solid {Theme.BORDER_STRONG};
+                border-radius: 4px;
+                background: {Theme.SURFACE};
+            }}
+            QProgressBar::chunk {{
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #5b9bd5, stop:0.5 #7db9e6, stop:1 #5b9bd5);
-                border-radius: 2px;
-            }
+                    stop:0 {Theme.ACCENT}, stop:0.5 {Theme.ACCENT_HOVER}, stop:1 {Theme.ACCENT});
+                border-radius: 3px;
+            }}
         """)
         self._loading_progress.hide()
         self._statusbar.addPermanentWidget(self._loading_progress)
@@ -4181,21 +4293,23 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(150, lambda: self._auto_resize_columns(table_view))
 
         # 样式和布局
-        table_view.setStyleSheet("""
-            QTableView {
-                gridline-color: #e0e0e0;
+        table_view.setStyleSheet(f"""
+            QTableView {{
+                background: {Theme.SURFACE};
+                gridline-color: {Theme.GRID};
                 font-size: 13px;
-                selection-background-color: #b8d4f0;
-                selection-color: #000;
-            }
-            QHeaderView::section {
-                background-color: #f0f0e8;
-                padding: 6px;
-                border: 1px solid #d0d0c8;
+                selection-background-color: {Theme.SELECTION};
+                selection-color: {Theme.TEXT};
+            }}
+            QHeaderView::section {{
+                background-color: {Theme.HEADER_BG};
+                color: {Theme.HEADER_TEXT};
+                padding: 6px 8px;
+                border: 1px solid {Theme.BORDER};
                 border-top: none;
                 font-weight: bold;
                 font-size: 13px;
-            }
+            }}
         """)
 
         layout.addWidget(table_view)
@@ -6339,30 +6453,125 @@ def main():
     app.setApplicationName("Lua Table Editor")
     app.setOrganizationName("LuaTableEditor")
 
-    # 全局样式
-    app.setStyleSheet("""
-        QMainWindow {
-            background-color: #f0f0f0;
-        }
-        QMenuBar {
-            background-color: #e8e8e0;
-            border-bottom: 1px solid #ccc;
-            padding: 2px;
+    # 全局样式：现代浅色主题（配色统一取自 Theme）
+    app.setStyleSheet(f"""
+        QMainWindow {{
+            background-color: {Theme.BG};
+        }}
+        QDialog {{
+            background-color: {Theme.SURFACE};
+        }}
+        QMenuBar {{
+            background-color: {Theme.PANEL_HEADER};
+            border-bottom: 1px solid {Theme.BORDER_STRONG};
+            padding: 3px;
             font-size: 13px;
-        }
-        QMenuBar::item:selected {
-            background-color: #d0d0d0;
-            border-radius: 3px;
-        }
-        QMenu {
-            background-color: #fff;
-            border: 1px solid #ccc;
-            padding: 4px;
+            color: {Theme.TEXT};
+        }}
+        QMenuBar::item {{
+            padding: 4px 10px;
+            border-radius: 5px;
+        }}
+        QMenuBar::item:selected {{
+            background-color: {Theme.ACCENT_SOFT};
+        }}
+        QMenu {{
+            background-color: {Theme.SURFACE};
+            border: 1px solid {Theme.BORDER_STRONG};
+            border-radius: 7px;
+            padding: 5px;
             font-size: 13px;
-        }
-        QMenu::item:selected {
-            background-color: #e0e8f0;
-        }
+            color: {Theme.TEXT};
+        }}
+        QMenu::item {{
+            padding: 5px 26px 5px 20px;
+            border-radius: 4px;
+        }}
+        QMenu::item:selected {{
+            background-color: {Theme.ACCENT_SOFT};
+        }}
+        QMenu::separator {{
+            height: 1px;
+            background: {Theme.BORDER};
+            margin: 4px 8px;
+        }}
+        QPushButton {{
+            border: 1px solid {Theme.BORDER_STRONG};
+            border-radius: 6px;
+            padding: 5px 14px;
+            background: {Theme.BTN_BG};
+            color: {Theme.TEXT};
+        }}
+        QPushButton:hover {{
+            background: {Theme.BTN_HOVER};
+            border-color: {Theme.ACCENT};
+        }}
+        QPushButton:pressed {{
+            background: {Theme.BTN_PRESS};
+        }}
+        QPushButton:disabled {{
+            color: {Theme.TEXT_FAINT};
+            background: {Theme.SURFACE_ALT};
+        }}
+        QLineEdit, QTextEdit, QPlainTextEdit, QComboBox {{
+            border: 1px solid {Theme.BORDER_STRONG};
+            border-radius: 5px;
+            padding: 4px 8px;
+            background: {Theme.SURFACE};
+            color: {Theme.TEXT};
+            selection-background-color: {Theme.SELECTION};
+        }}
+        QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus {{
+            border-color: {Theme.ACCENT};
+        }}
+        QCheckBox {{
+            color: {Theme.TEXT};
+            spacing: 6px;
+        }}
+        QSplitter::handle {{
+            background-color: {Theme.BORDER_STRONG};
+        }}
+        QToolTip {{
+            background-color: {Theme.TEXT};
+            color: {Theme.SURFACE};
+            border: none;
+            padding: 5px 8px;
+            border-radius: 4px;
+        }}
+        QScrollBar:vertical {{
+            background: {Theme.SURFACE_ALT};
+            width: 12px;
+            border: none;
+        }}
+        QScrollBar::handle:vertical {{
+            background: {Theme.BORDER_STRONG};
+            border-radius: 5px;
+            min-height: 30px;
+            margin: 2px;
+        }}
+        QScrollBar::handle:vertical:hover {{
+            background: {Theme.TEXT_FAINT};
+        }}
+        QScrollBar:horizontal {{
+            background: {Theme.SURFACE_ALT};
+            height: 12px;
+            border: none;
+        }}
+        QScrollBar::handle:horizontal {{
+            background: {Theme.BORDER_STRONG};
+            border-radius: 5px;
+            min-width: 30px;
+            margin: 2px;
+        }}
+        QScrollBar::handle:horizontal:hover {{
+            background: {Theme.TEXT_FAINT};
+        }}
+        QScrollBar::add-line, QScrollBar::sub-line, QScrollBar::add-page, QScrollBar::sub-page {{
+            background: none;
+            border: none;
+            height: 0;
+            width: 0;
+        }}
     """)
 
     window = MainWindow()
