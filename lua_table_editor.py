@@ -71,6 +71,7 @@ class Theme:
     SEL_ROW         = '#c6dcfc'   # 整行选中
     SEL_COL         = '#ffd9b3'   # 整列选中
     SEL_CROSS       = '#ffd24d'   # 行列交叉点
+    SEL_BORDER      = '#2f6fe0'   # 选区外沿描边（比选中底色深一档，勾出选区轮廓）
     CROSS_BORDER    = '#e69500'
     MARKER          = '#4a86e8'   # 行号列左侧标记条
 
@@ -939,17 +940,22 @@ class LuaTableModel(QAbstractTableModel):
         if not self._data:
             return
         fields = self._data.field_names
-        # 统计每列每个值的出现次数
-        counts: dict = {}  # {(col, value_str): count}
+        # 统计每列每个值的出现次数。
+        # 重复判定键用 (类型名, 原值) 而不是 _value_to_lua()：后者对每个
+        # 字符串做逐字符转义，万行×多列的表会执行百万级字符操作，是
+        # 大表加载卡顿的主热点之一。类型化键语义等价——int/float/bool/
+        # str/LuaTableStr(子表表达式) 各自成组，与 _value_to_lua 的分组
+        # 结果一一对应（'1' 与 1 不会混同：str 键带类型名隔离）。
+        counts: dict = {}  # {(col, type_name, value): count}
         for row_entry in self._data.rows:
             if row_entry.row_type != 'data':
                 continue
+            rd = row_entry.data
             for c, fn in enumerate(fields):
-                val = row_entry.data.get(fn, '')
+                val = rd.get(fn, '')
                 if val is None or val == '':
                     continue
-                val_str = LuaSerializer._value_to_lua(val)
-                key = (c, val_str)
+                key = (c, type(val).__name__, val)
                 counts[key] = counts.get(key, 0) + 1
         # 只保留出现次数 >= 2 的项
         for key, cnt in counts.items():
@@ -970,8 +976,8 @@ class LuaTableModel(QAbstractTableModel):
         val = re.data.get(fn, '')
         if val is None or val == '':
             return False
-        val_str = LuaSerializer._value_to_lua(val)
-        return self._duplicate_set.get((col - 1, val_str), False)
+        # 与 _rebuild_duplicates 使用同一类型化键（见其注释）
+        return self._duplicate_set.get((col - 1, type(val).__name__, val), False)
 
     @property
     def table_data(self) -> LuaTableData:
@@ -1757,6 +1763,10 @@ class LuaTableDelegate(QStyledItemDelegate):
                 option.rect.bottomLeft(), option.rect.bottomRight()
             )
 
+            # 选区外沿描边
+            self._draw_selection_outline(painter, option, index,
+                                         option.widget or self.parent())
+
             painter.restore()
             return
 
@@ -1879,8 +1889,52 @@ class LuaTableDelegate(QStyledItemDelegate):
             painter.drawRect(r)
             painter.restore()
 
+        # ---- 选区外沿描边：只画与未选中格相邻的边，多选区域呈连续外框 ----
+        if col > 0:
+            self._draw_selection_outline(painter, option, index, view)
+
         # ---- 填充柄指示器（仅单一连续选区时绘制） ----
         self._draw_fill_handle(painter, option, row, col)
+
+    def _draw_selection_outline(self, painter, option, index, view):
+        """为选中区域绘制描边提示。
+
+        只在"该格被选中 且 相邻格未被选中"的边缘画线，使整块选区呈现
+        连续的外沿轮廓，而不是每格一圈框。邻居判断经视图自己的
+        selectionModel（option.widget），主视图与冻结列浮层各自的
+        索引/选择模型配对一致，跨视图不会错判。"""
+        if view is None:
+            return
+        sm = view.selectionModel()
+        if sm is None or not sm.hasSelection():
+            return
+        if not sm.isSelected(index):
+            return
+
+        m = index.model()
+        r, c = index.row(), index.column()
+        is_sel = sm.isSelected
+        # 越界 sibling 返回无效索引，isSelected(无效)=False，边界自然画线
+        top = not is_sel(index.sibling(r - 1, c))
+        bottom = not is_sel(index.sibling(r + 1, c))
+        left = not is_sel(index.sibling(r, c - 1))
+        right = not is_sel(index.sibling(r, c + 1))
+        if not (top or bottom or left or right):
+            return  # 完全处于选区内部：不画
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setPen(QPen(QColor(Theme.SEL_BORDER), 2))
+        rect = option.rect.adjusted(1, 1, -1, -1)
+        if top:
+            painter.drawLine(rect.topLeft(), rect.topRight())
+        if bottom:
+            painter.drawLine(rect.bottomLeft(), rect.bottomRight())
+        if left:
+            painter.drawLine(rect.topLeft(), rect.bottomLeft())
+        if right:
+            painter.drawLine(rect.topRight(), rect.bottomRight())
+        painter.restore()
 
     def _draw_fill_handle(self, painter, option, row, col):
         """绘制填充柄指示器"""
@@ -3783,7 +3837,6 @@ class MainWindow(QMainWindow):
         self._tabs_data: dict = {}
         self._find_dialog: Optional[FindDialog] = None
         self._untitled_counter = 1
-        self._loading = False  # 防止重复加载请求（手动打开/刷新）
         self._workers: list = []  # 后台加载线程引用，避免被提前回收
         self._context_row = -1  # 右键所在行（用于复制/粘贴整行）
 
@@ -3802,8 +3855,9 @@ class MainWindow(QMainWindow):
         self._auto_refresh_timer.timeout.connect(self._auto_refresh_all)
         self._auto_refresh_timer.start()
 
-        # 待打开文件队列：后台加载有全局互斥，多文件拖放需排队（BUG-29）
-        self._pending_opens: list = []
+        # 在途后台加载登记表：{id(td): file_path}，每标签页独立加载，
+        # 无全局锁；仅用于状态栏进度指示
+        self._active_loads: dict = {}
         self._recent_files = self._load_recent_files()
         self._workspace_folders = self._load_workspace_folders()
         self._file_notes: dict = self._load_file_notes()
@@ -4184,15 +4238,9 @@ class MainWindow(QMainWindow):
         pass  # 已通过菜单 QAction 绑定
 
     # ---- 标签页管理 ----
-    def _create_tab(self, data: LuaTableData, title: str,
-                    workspace_color: str = None) -> QWidget:
-        """创建新标签页"""
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        # ---- 工作区颜色带条 ----
+    @staticmethod
+    def _add_workspace_strip(layout, workspace_color):
+        """在标签页布局顶部加工作区颜色带条"""
         if workspace_color:
             color_strip = QFrame()
             color_strip.setFixedHeight(3)
@@ -4200,6 +4248,44 @@ class MainWindow(QMainWindow):
                 f"background-color: {workspace_color}; border: none;"
             )
             layout.addWidget(color_strip)
+
+    def _create_tab(self, data: LuaTableData, title: str,
+                    workspace_color: str = None) -> QWidget:
+        """创建已构建完成的标签页（同步建表，供新建表等场景使用）"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self._add_workspace_strip(layout, workspace_color)
+
+        self._tabs_data[id(tab)] = {
+            'data': data,
+            'model': None,
+            'proxy': None,
+            'view': None,
+            'tab': tab,
+            'title': title,
+            'file_path': data.file_path or '',
+            'loading': False,   # 该标签页是否处于后台加载/重载中
+            'page': None,       # 占位加载页（仅占位标签页有）
+            'workspace_folder': '',
+            'workspace_color': workspace_color,
+        }
+        self._build_tab_content(self._tabs_data[id(tab)])
+
+        idx = self._tab_widget.addTab(tab, title)
+        self._tab_widget.setCurrentIndex(idx)
+        self._show_tabs()  # 切换到标签页视图
+        return tab
+
+    def _build_tab_content(self, td: dict):
+        """在标签页内构建表格视图/模型/代理并接线（td['data'] 必须就绪）。
+
+        与标签页骨架分离：打开文件时先创建占位页，后台解析完成后
+        才调用本方法填充真实表格，UI 线程不承担解析与重活。"""
+        data = td['data']
+        tab = td['tab']
+        layout = tab.layout()
 
         # 表格视图
         table_view = LuaTableView()
@@ -4273,21 +4359,9 @@ class MainWindow(QMainWindow):
         header.resizeSection(0, 50)  # 行号列窄一点
         header.setStretchLastSection(True)
 
-        # 存储关联数据
-        idx = self._tab_widget.addTab(tab, title)
-        self._tab_widget.setCurrentIndex(idx)
-        self._show_tabs()  # 切换到标签页视图
-
-        self._tabs_data[id(tab)] = {
-            'data': data,
-            'model': model,
-            'proxy': proxy,
-            'view': table_view,
-            'tab': tab,
-            'title': title,
-            'workspace_folder': '',
-            'workspace_color': workspace_color,
-        }
+        td['model'] = model
+        td['proxy'] = proxy
+        td['view'] = table_view
 
         # 延迟自动调整列宽（延迟 150ms 等 UI 渲染稳定后再测量）
         QTimer.singleShot(150, lambda: self._auto_resize_columns(table_view))
@@ -4314,21 +4388,141 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(table_view)
 
+    def _create_loading_tab(self, file_path: str):
+        """创建加载占位标签页：立即可见可切换，解析在后台线程进行，
+        完成后由 _finalize_tab_load 填充真实表格。用户在加载期间可以
+        自由操作其他标签页（不再有全局加载锁）。"""
+        title = os.path.basename(file_path)
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        ws_folder = self._workspace_panel.get_workspace_for_file(file_path)
+        ws_color = None
+        if ws_folder:
+            ws_color = self._workspace_panel.get_workspace_color(ws_folder)
+        self._add_workspace_strip(layout, ws_color)
+
+        # ---- 占位加载页 ----
+        page = QWidget()
+        page.setStyleSheet(f"background: {Theme.SURFACE};")
+        pl = QVBoxLayout(page)
+        pl.setAlignment(Qt.AlignCenter)
+        ph_icon = QLabel("⏳")
+        ph_icon.setAlignment(Qt.AlignCenter)
+        ph_icon.setStyleSheet("font-size: 30px; background: transparent;")
+        ph_label = QLabel(f"正在加载 {title} …")
+        ph_label.setAlignment(Qt.AlignCenter)
+        ph_label.setStyleSheet(
+            f"color: {Theme.TEXT_MUTED}; font-size: 14px; background: transparent;")
+        ph_sub = QLabel(file_path)
+        ph_sub.setAlignment(Qt.AlignCenter)
+        ph_sub.setStyleSheet(
+            f"color: {Theme.TEXT_FAINT}; font-size: 12px; background: transparent;")
+        pl.addWidget(ph_icon)
+        pl.addWidget(ph_label)
+        pl.addWidget(ph_sub)
+        layout.addWidget(page)
+
+        td = {
+            'data': None,
+            'model': None,
+            'proxy': None,
+            'view': None,
+            'tab': tab,
+            'title': title,
+            'file_path': file_path,
+            'loading': False,      # worker 是否在途（_start_load 管理）
+            'placeholder': True,   # 是否还是占位页（未填充真实表格）
+            'load_failed': False,  # 上次加载是否失败（失败页可原位重试）
+            'page': page,
+            'ph_icon': ph_icon,
+            'ph_label': ph_label,
+            'ph_sub': ph_sub,
+            'workspace_folder': ws_folder or '',
+            'workspace_color': ws_color,
+        }
+        self._tabs_data[id(tab)] = td
+
+        idx = self._tab_widget.addTab(tab, f"⏳ {title}")
+        self._tab_widget.setCurrentIndex(idx)
+        self._show_tabs()
+        self._tab_widget.setTabToolTip(idx, file_path)
+        self._status_label.setText(f"正在加载: {title} ...")
         return tab
 
+    def _finalize_tab_load(self, td: dict, data: LuaTableData, file_path: str):
+        """后台解析完成：把真实表格填入占位标签页（主线程执行）"""
+        # 加载期间标签页可能已被关闭
+        if self._tabs_data.get(id(td['tab'])) is not td:
+            return
+        page = td.get('page')
+        td['page'] = None
+        td['placeholder'] = False
+        td['load_failed'] = False
+        td['data'] = data
+        td['title'] = os.path.basename(file_path)
+        td['file_path'] = file_path
+        if page is not None:
+            page.setParent(None)
+            page.deleteLater()
+        self._build_tab_content(td)
+        self._update_tab_title(td)
+        self._update_tab_path_label(td)
+        self._add_recent_file(file_path)
+        self._update_statusbar()
+        self._status_label.setText(f"已打开: {file_path}")
+
+    def _switch_to_tab(self, tab: QWidget):
+        """切换到指定标签页"""
+        for i in range(self._tab_widget.count()):
+            if self._tab_widget.widget(i) == tab:
+                self._tab_widget.setCurrentIndex(i)
+                return
+
+    def _reset_placeholder(self, td: dict):
+        """把失败占位页恢复为加载中显示（原位重试前调用）"""
+        if td.get('ph_icon') is not None:
+            td['ph_icon'].setText("⏳")
+            td['ph_label'].setText(f"正在加载 {td.get('title', '')} …")
+            td['ph_sub'].setText(td.get('file_path', ''))
+        td['load_failed'] = False
+
+        return tab
+
+    # 自适应列宽的抽样行数上限：全表 ResizeToContents 会遍历 行数×列数
+    # 次 data() 调用，十万行级表格在 UI 线程上要卡数秒，抽样已足够代表性
+    RESIZE_SAMPLE_ROWS = 300
+
     def _auto_resize_columns(self, view: QTableView):
-        """自动调整列宽以适应内容"""
+        """自适应列宽（抽样前 N 行测量，避免大表全表测量卡顿）"""
         # 该方法经 QTimer 延迟调用，期间标签页可能已被关闭，视图对象已销毁（BUG-13）
         if not any(td['view'] is view for td in self._tabs_data.values()):
             return
+        model = view.model()
+        if model is None or model.columnCount() <= 1:
+            return
         header = view.horizontalHeader()
         header.resizeSection(0, 50)  # 行号列固定
-        # 一次性测量所有列，避免重复 O(n_cols * n_rows * n_cols) 的代价
-        header.resizeSections(QHeaderView.ResizeToContents)
-        # 然后对个别过宽的列进行缩窄
-        for col in range(1, header.count()):
-            if header.sectionSize(col) > 280:
-                header.resizeSection(col, 280)
+        fm = view.fontMetrics()
+        n = min(self.RESIZE_SAMPLE_ROWS, model.rowCount())
+        for col in range(1, model.columnCount()):
+            h = model.headerData(col, Qt.Horizontal) or ''
+            w = fm.horizontalAdvance(str(h)) + 24
+            for r in range(n):
+                v = model.index(r, col).data(Qt.DisplayRole)
+                if v is None:
+                    continue
+                s = str(v)
+                if '\n' in s:  # 多行单元格取最长一行
+                    for line in s.split('\n'):
+                        w = max(w, fm.horizontalAdvance(line) + 20)
+                else:
+                    w = max(w, fm.horizontalAdvance(s) + 20)
+            # 下限 100（默认列宽量级），上限 280（与原逻辑一致）
+            header.resizeSection(col, max(100, min(280, w)))
+        header.setStretchLastSection(True)
 
     def eventFilter(self, obj, event):
         """事件过滤器：Undo/Redo + Enter 键导航"""
@@ -4410,11 +4604,18 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     def _get_current_tab_data(self):
-        """获取当前标签页的数据"""
+        """获取当前标签页的数据。
+
+        占位/加载中的标签页视作无活动表：其视图/模型尚未构建（或正被
+        后台结果替换），任何依赖 td['view']/td['data'] 的操作都应 no-op，
+        避免半初始化对象被访问。"""
         tab = self._tab_widget.currentWidget()
         if tab is None:
             return None
-        return self._tabs_data.get(id(tab))
+        td = self._tabs_data.get(id(tab))
+        if td is None or td.get('loading') or td.get('placeholder'):
+            return None
+        return td
 
     def _get_proxy(self) -> Optional[FilterProxyModel]:
         td = self._get_current_tab_data()
@@ -4458,7 +4659,9 @@ class MainWindow(QMainWindow):
             td = self._get_current_tab_data()
         if not td:
             return
-        data = td['data']
+        data = td.get('data')
+        if data is None:
+            return  # 占位/加载中标签页没有数据对象
         base_title = td.get('title', '')
         # 去 * 获得纯粹文件名
         clean_title = base_title.lstrip('*')
@@ -4529,107 +4732,104 @@ class MainWindow(QMainWindow):
         self._open_file_path(file_path)
 
     def _open_file_path(self, file_path: str):
-        """打开指定路径的文件（后台线程解析，UI 不再卡顿）"""
-        # 检查文件是否已打开（加载前检查可快速返回，无需进度条）
-        for tab_id, td in self._tabs_data.items():
-            if td['data'].file_path == file_path:
-                for i in range(self._tab_widget.count()):
-                    if self._tab_widget.widget(i) == td['tab']:
-                        self._tab_widget.setCurrentIndex(i)
-                        self._status_label.setText(f"已切换到: {file_path}")
-                        return
+        """打开指定路径：立即创建占位标签页并后台解析，UI 全程不阻塞。
 
-        # 防止重复加载请求（手动加载期间不重复触发）
-        if self._loading:
-            self._status_label.setText("正在加载中，请稍候...")
-            return
-
-        self._start_load(file_path, lambda data, fp: self._finalize_open(data, fp))
-
-    def _finalize_open(self, data: LuaTableData, file_path: str):
-        """后台加载完成后创建标签页并收尾（主线程执行）"""
-        # 若加载期间该文件已被打开（例如重复点击），直接切换
-        for tab_id, td in self._tabs_data.items():
-            if td['data'].file_path == file_path:
-                for i in range(self._tab_widget.count()):
-                    if self._tab_widget.widget(i) == td['tab']:
-                        self._tab_widget.setCurrentIndex(i)
-                        self._status_label.setText(f"已切换到: {file_path}")
-                        return
-
-        title = os.path.basename(file_path)
-
-        # 检测文件所属工作区
-        ws_folder = self._workspace_panel.get_workspace_for_file(file_path)
-        ws_color = None
-        if ws_folder:
-            ws_color = self._workspace_panel.get_workspace_color(ws_folder)
-
-        tab = self._create_tab(data, title, workspace_color=ws_color)
-        td = self._tabs_data.get(id(tab))
-        if td and ws_folder:
-            td['workspace_folder'] = ws_folder
-        if td:
-            td['file_path'] = file_path
-            self._update_tab_path_label(td)
-
-        self._add_recent_file(file_path)
-        self._update_statusbar()
-        self._status_label.setText(f"已打开: {file_path}")
-
-    # ---- 后台加载编排 ----
-    def _start_load(self, file_path: str, on_loaded, show_progress=True, auto=False):
-        """在后台线程加载文件。
-
-        on_loaded(data, file_path) 在加载完成后于主线程调用。
-        show_progress=True 时显示进度条并设置全局 _loading 锁（用于用户主动打开/刷新）；
-        auto=True 时不弹进度条、不设全局锁（用于静默的定时自动刷新）。
-        """
-        if show_progress:
-            if self._loading:
-                self._status_label.setText("正在加载中，请稍候...")
+        每个标签页独立加载（td['loading'] 是单页互斥位），多文件并发
+        解析互不影响，其他标签页在加载期间照常可用。"""
+        # 已打开 / 占位加载中 → 直接切换
+        for td in self._tabs_data.values():
+            if td.get('loading'):
+                if td.get('file_path') == file_path:
+                    self._switch_to_tab(td['tab'])
+                    self._status_label.setText(f"正在加载中: {file_path}")
+                    return
+                continue
+            if td.get('placeholder'):
+                if td.get('file_path') != file_path:
+                    continue
+                self._switch_to_tab(td['tab'])
+                if td.get('load_failed'):
+                    # 上次加载失败的占位页：原位重试
+                    self._reset_placeholder(td)
+                    self._start_load(file_path, td,
+                                     lambda d, fp, t=td: self._finalize_tab_load(t, d, fp))
                 return
-            self._loading = True
-            self._loading_progress.show()
-            self._status_label.setText(f"正在加载: {os.path.basename(file_path)}...")
-            QApplication.processEvents()  # 让进度条先渲染出来
+            if td['data'] and td['data'].file_path == file_path:
+                self._switch_to_tab(td['tab'])
+                self._status_label.setText(f"已切换到: {file_path}")
+                return
 
+        tab = self._create_loading_tab(file_path)
+        td = self._tabs_data.get(id(tab))
+        self._start_load(file_path, td,
+                         lambda d, fp: self._finalize_tab_load(td, d, fp))
+
+    # ---- 后台加载编排（每标签页独立，无全局锁） ----
+    def _start_load(self, file_path: str, td: dict, on_loaded, auto=False,
+                    show_status=True):
+        """为单个标签页启动后台解析线程（解析在 worker，UI 线程零阻塞）。
+
+        td['loading'] 是该标签页的加载互斥位；_active_loads 汇总所有在途
+        加载用于状态栏指示。on_loaded(data, file_path) 在主线程、且标签页
+        仍存活时调用。"""
+        if td.get('loading'):
+            return  # 该标签页已有加载在途
+        td['loading'] = True
+        self._active_loads[id(td)] = file_path
+        self._update_load_indicator()
+        if show_status:
+            self._status_label.setText(
+                f"正在加载: {os.path.basename(file_path)}...")
         worker = LuaLoadWorker(file_path)
         self._workers.append(worker)  # 保持引用，避免被回收
         worker.signals.finished.connect(
-            lambda d, fp, cb=on_loaded, sp=show_progress:
-                self._on_load_finished(d, fp, cb, sp))
+            lambda d, fp, t=td, cb=on_loaded, a=auto:
+                self._on_tab_data_ready(t, d, fp, cb, a))
         worker.signals.error.connect(
-            lambda msg, sp=show_progress, a=auto: self._on_load_error(msg, sp, a))
+            lambda msg, t=td, cb=on_loaded, a=auto:
+                self._on_tab_load_error(t, msg, cb, a))
         worker.finished.connect(lambda w=worker: self._on_worker_done(w))
         worker.start()
 
-    def _on_load_finished(self, data, file_path, on_loaded, show_progress):
+    def _on_tab_data_ready(self, td, data, file_path, on_loaded, auto):
+        """worker 解析完成（主线程）：标签页存活才回调，随后结束加载态"""
+        alive = self._tabs_data.get(id(td['tab'])) is td
         try:
-            on_loaded(data, file_path)
+            if alive:
+                on_loaded(data, file_path)
         finally:
-            if show_progress:
-                self._loading_progress.hide()
-                self._loading = False
-            # 当前加载结束，继续排空多文件拖放队列（BUG-29）
-            self._drain_pending_opens()
+            self._finish_load(td)
 
-    def _on_load_error(self, msg, show_progress, auto):
-        if show_progress:
-            self._loading_progress.hide()
-            self._loading = False
-        if auto:
+    def _on_tab_load_error(self, td, msg, on_loaded, auto):
+        """worker 加载失败（主线程）：占位页就地显示错误，重载则弹窗/状态栏"""
+        alive = self._tabs_data.get(id(td['tab'])) is td
+        self._finish_load(td)
+        if not alive:
+            return
+        if td.get('ph_label') is not None and td.get('page') is not None:
+            # 占位页就地显示错误，保留标签页；重新打开同路径文件可原位重试
+            td['load_failed'] = True
+            td['ph_icon'].setText("❌")
+            td['ph_label'].setText("加载失败")
+            td['ph_sub'].setText(msg[:300])
+            self._status_label.setText(f"加载失败: {td.get('file_path', '')}")
+        elif auto:
             self._status_label.setText(f"自动刷新失败: {msg}")
         else:
             QMessageBox.critical(self, "加载失败", f"无法加载文件:\n{msg}")
-        self._drain_pending_opens()
 
-    def _drain_pending_opens(self):
-        """依次打开排队的文件；一旦某次加载启动（_loading=True）即让出，
-        由 _on_load_finished/_on_load_error 继续排空（BUG-29）。"""
-        while self._pending_opens and not self._loading:
-            path = self._pending_opens.pop(0)
-            self._open_file_path(path)
+    def _finish_load(self, td):
+        """结束某标签页的加载态"""
+        td['loading'] = False
+        self._active_loads.pop(id(td), None)
+        self._update_load_indicator()
+
+    def _update_load_indicator(self):
+        """状态栏不确定进度条：任一标签页在途加载时显示（非阻塞）"""
+        if self._active_loads:
+            self._loading_progress.show()
+        else:
+            self._loading_progress.hide()
 
     def _on_worker_done(self, worker):
         if worker in self._workers:
@@ -4716,8 +4916,8 @@ class MainWindow(QMainWindow):
                                 f"文件已不存在:\n{data.file_path}")
             return
 
-        # 防止重复加载
-        if self._loading:
+        # 防止重复加载（该标签页级互斥；其他标签页不受影响）
+        if td.get('loading'):
             self._status_label.setText("正在加载中，请稍候...")
             return
 
@@ -4734,18 +4934,15 @@ class MainWindow(QMainWindow):
         self._reload_tab(td, show_status=True)
 
     def _reload_tab(self, td, show_status=False, auto=False):
-        """后台重新解析某标签页对应的磁盘文件并更新模型。"""
-        data = td['data']
-        fp = data.file_path
+        """后台重新解析某标签页对应的磁盘文件并更新模型（单页独立，不阻塞其他页）。"""
+        data = td.get('data')
+        fp = data.file_path if data else td.get('file_path')
         if not fp or not os.path.exists(fp):
             return
 
         def on_loaded(new_data, file_path):
-            # 重新校验：加载期间标签页可能已被关闭（td 失效，BUG-13）
-            if self._tabs_data.get(id(td['tab'])) is not td:
-                return
             # 重新校验：若加载期间该表被改成已修改，放弃覆盖以免丢失编辑
-            if data.modified:
+            if data and data.modified:
                 return
             model = td['model']
             new_data.modified = False
@@ -4760,8 +4957,8 @@ class MainWindow(QMainWindow):
             proxy.clear_filter()
             self._filter_status.setText("")
 
-            # 更新标签页标题
-            self._update_tab_title()
+            # 更新标签页标题（按 td 定位，后台标签页也能刷新）
+            self._update_tab_title(td)
 
             # 自动调整列宽
             QTimer.singleShot(50, lambda: self._auto_resize_columns(td['view']))
@@ -4770,17 +4967,20 @@ class MainWindow(QMainWindow):
             if show_status:
                 self._status_label.setText(f"已刷新: {file_path}")
 
-        self._start_load(fp, on_loaded, show_progress=not auto, auto=auto)
+        self._start_load(fp, td, on_loaded, auto=auto, show_status=show_status)
 
     def _auto_refresh_all(self):
-        """定时自动刷新：仅刷新“未修改且磁盘文件已变更”的已打开标签页。"""
+        """定时自动刷新：仅刷新“未修改且磁盘文件已变更”的已打开标签页。
+
+        每个标签页独立加载，重载中的页跳过，其余页不受影响。"""
         if not self._auto_refresh_enabled:
             return
-        # 用户主动加载/刷新进行中时，本 tick 跳过，避免互相干扰
-        if self._loading:
-            return
         for td in list(self._tabs_data.values()):
-            data = td['data']
+            if td.get('loading'):
+                continue  # 占位/重载进行中
+            data = td.get('data')
+            if data is None:
+                continue
             fp = data.file_path
             if not fp or data.modified or not os.path.exists(fp):
                 continue
@@ -4793,13 +4993,17 @@ class MainWindow(QMainWindow):
                 self._reload_tab(td, auto=True)
 
     def _close_tab(self):
-        """关闭当前标签页"""
-        td = self._get_current_tab_data()
+        """关闭当前标签页。
+
+        注意用原始 td 查找而非 _get_current_tab_data()：后者对占位/加载中
+        标签页返回 None，会导致加载中的标签页无法关闭。"""
+        tab = self._tab_widget.currentWidget()
+        td = self._tabs_data.get(id(tab)) if tab is not None else None
         if not td:
             return
 
-        data = td['data']
-        if data.modified:
+        data = td.get('data')
+        if data and data.modified:
             title = td['title'].lstrip('*')
             reply = QMessageBox.question(
                 self, "未保存的更改",
@@ -6357,16 +6561,17 @@ class MainWindow(QMainWindow):
         event.ignore()
 
     def _open_files(self, paths):
-        """依次打开多个文件（后台加载互斥，排队处理，BUG-29）"""
-        self._pending_opens.extend(paths)
-        self._drain_pending_opens()
+        """打开多个文件：每标签页独立后台加载，可并发进行，互不阻塞
+        （拖入多个文件时每个都立即可见加载状态，而非串行排队）"""
+        for p in paths:
+            self._open_file_path(p)
 
     # ---- 关闭事件 ----
     def closeEvent(self, event):
         """关闭主窗口时检查所有未保存标签页"""
-        # 检查所有标签页
+        # 检查所有标签页（占位/加载中标签页无数据对象，跳过）
         for tab_id, td in list(self._tabs_data.items()):
-            if td['data'].modified:
+            if td.get('data') and td['data'].modified:
                 title = td['title'].lstrip('*')
                 # 切换到该标签页
                 for i in range(self._tab_widget.count()):

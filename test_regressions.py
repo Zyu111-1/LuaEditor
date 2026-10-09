@@ -346,6 +346,161 @@ def test_backspace_uses_source_index():
     assert d.rows[0].data.get('v') == 'a', "不该被清空的行被清空"
 
 # ---------------------------------------------------------------------------
+# 独立加载 / 描边 / 性能
+# ---------------------------------------------------------------------------
+
+def _wait_until(cond, timeout_ms=8000):
+    """处理事件直到条件成立或超时（worker 线程异步完成需要事件循环）"""
+    from PySide6.QtCore import QElapsedTimer
+    timer = QElapsedTimer()
+    timer.start()
+    while timer.elapsed() < timeout_ms:
+        app.processEvents()
+        if cond():
+            return True
+        app.processEvents()
+    return cond()
+
+def test_tab_loads_async_with_placeholder():
+    """独立加载：打开文件先出现占位标签页，解析完成后填充真实表格。"""
+    import tempfile
+    path = os.path.join(tempfile.gettempdir(), 'lte_test_async.lua')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('T = {\n    {id=1},\n    {id=2},\n}\nreturn T')
+    w = MainWindow()
+    w._open_file_path(path)
+    # 立即检查：占位页存在（loading 或已完成，取决于调度，但最终必须完成）
+    ok = _wait_until(lambda: any(
+        not td.get('loading') and td.get('view') is not None
+        for td in w._tabs_data.values()))
+    assert ok, "后台加载未在超时时间内完成"
+    td = next(td for td in w._tabs_data.values()
+              if td.get('file_path') == path and td.get('view') is not None)
+    assert td['loading'] is False
+    assert td['model'].rowCount() >= 3
+    # 标签标题不应残留 ⏳ 前缀
+    idx = w._tab_widget.indexOf(td['tab'])
+    assert '⏳' not in w._tab_widget.tabText(idx)
+    # 清理
+    w._tabs_data.clear()
+    for i in reversed(range(w._tab_widget.count())):
+        w._tab_widget.removeTab(i)
+    os.remove(path)
+
+def test_open_same_file_while_loading_switches():
+    """同一文件重复打开：加载中切到占位页，已打开切到已有页，不重复开标签。"""
+    import tempfile
+    path = os.path.join(tempfile.gettempdir(), 'lte_test_dup.lua')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('T = {\n    {id=1},\n}')
+    w = MainWindow()
+    w._open_file_path(path)
+    n1 = w._tab_widget.count()
+    w._open_file_path(path)   # 占位中再次打开
+    w._open_file_path(path)   # 已完成后再次打开
+    assert w._tab_widget.count() == n1, "重复打开产生了多个标签页"
+    _wait_until(lambda: any(
+        td.get('file_path') == path and not td.get('loading')
+        for td in w._tabs_data.values()))
+    w._tabs_data.clear()
+    for i in reversed(range(w._tab_widget.count())):
+        w._tab_widget.removeTab(i)
+    os.remove(path)
+
+def test_other_tab_usable_during_load():
+    """大表加载期间，其他标签页保持可用（无全局加载锁）。"""
+    import tempfile
+    big = os.path.join(tempfile.gettempdir(), 'lte_test_big.lua')
+    with open(big, 'w', encoding='utf-8') as f:
+        f.write('T = {\n' + ''.join(
+            f'    [{{id={i}}}] = {{id={i}, name="n{i}", tag={{1,2,3}}}},\n'
+            for i in range(20000)) + '}')
+    w = MainWindow()
+    # 先开一个小表并选中
+    d = LuaParser.parse(FIXTURE_PLAIN)
+    tab = w._create_tab(d, 'small.lua')
+    td_small = w._tabs_data[id(tab)]
+    w._open_file_path(big)   # 异步开始加载大表
+    # 加载在途时，小表仍可编辑
+    model = td_small['model']
+    model.setData(model.index(0, 2), '999')
+    assert d.rows[0].data.get('v') == 999, "加载期间其他标签页编辑失效"
+    # 等大表加载完成
+    ok = _wait_until(lambda: any(
+        td.get('file_path') == big and not td.get('loading')
+        for td in w._tabs_data.values()), timeout_ms=30000)
+    assert ok, "大表后台加载超时"
+    td_big = next(td for td in w._tabs_data.values() if td.get('file_path') == big)
+    assert td_big['view'] is not None and td_big['model'].rowCount() >= 20000
+    w._tabs_data.clear()
+    for i in reversed(range(w._tab_widget.count())):
+        w._tab_widget.removeTab(i)
+    os.remove(big)
+
+def test_duplicates_typed_key_equivalence():
+    """重复值键与 _value_to_lua 语义等价：同组重复高亮，跨类型不误报。"""
+    d = LuaTableData(table_name='T', field_names=['a', 'b'])
+    d.rows = [
+        RowEntry(row_type='data', data={'a': 1, 'b': 'x'}),
+        RowEntry(row_type='data', data={'a': 1, 'b': 'x'}),   # 与上行重复
+        RowEntry(row_type='data', data={'a': '1', 'b': 2}),   # 字符串'1'≠数字1
+    ]
+    m = LuaTableModel()
+    m.set_data(d)
+    assert m.is_duplicate(0, 1) and m.is_duplicate(1, 1), "同值未标重"
+    assert m.is_duplicate(0, 2) and m.is_duplicate(1, 2), "同值未标重"
+    assert not m.is_duplicate(2, 1), "字符串 '1' 不应与数字 1 混同"
+    assert not m.is_duplicate(2, 2), "无重复值被误标"
+
+def test_selection_outline_smoke():
+    """选中描边：块选/整行选/当前格渲染不崩溃（冒烟）。"""
+    from PySide6.QtGui import QImage, QPainter
+    from PySide6.QtCore import QSize, QItemSelectionModel
+    d = LuaParser.parse(FIXTURE_HEADER)
+    m = LuaTableModel()
+    m.set_data(d)
+    p = FilterProxyModel()
+    p.setSourceModel(m)
+    from lua_table_editor import LuaTableView
+    view = LuaTableView()
+    view.setModel(p)
+    from lua_table_editor import LuaTableDelegate
+    view.setItemDelegate(LuaTableDelegate())
+    view.resize(600, 300)
+    view.show()
+    # 块选 2x2
+    sm = view.selectionModel()
+    sm.select(p.index(1, 1), QItemSelectionModel.Select)
+    sm.select(p.index(2, 2), QItemSelectionModel.Select | QItemSelectionModel.Current)
+    img = QImage(QSize(600, 300), QImage.Format_ARGB32)
+    view.render(img)
+    # 整行选
+    view.selectRow(1)
+    view.render(img)
+    view.hide()
+
+def test_auto_resize_samples_not_full_scan():
+    """自适应列宽：抽样完成且列宽落在 [100, 280] 区间。"""
+    d = LuaTableData(table_name='T', field_names=['short', 'wide'])
+    for i in range(2000):
+        d.rows.append(RowEntry(row_type='data',
+                               data={'short': i, 'wide': 'W' * 400 + str(i)}))
+    m = LuaTableModel()
+    m.set_data(d)
+    p = FilterProxyModel()
+    p.setSourceModel(m)
+    from lua_table_editor import LuaTableView
+    view = LuaTableView()
+    view.setModel(p)
+    w = MainWindow.__new__(MainWindow)  # 只用 _auto_resize_columns，绕过完整初始化
+    w._tabs_data = {1: {'view': view}}
+    w._auto_resize_columns(view)
+    header = view.horizontalHeader()
+    for col in range(1, header.count()):
+        size = header.sectionSize(col)
+        assert 100 <= size <= 280, f"列 {col} 宽度越界: {size}"
+
+# ---------------------------------------------------------------------------
 # 批次4：主窗口
 # ---------------------------------------------------------------------------
 
@@ -525,6 +680,12 @@ def main():
         test_paste_into_blank_row_kept,
         test_new_table_has_id_column,
         test_comment_text_normalization,
+        test_tab_loads_async_with_placeholder,
+        test_open_same_file_while_loading_switches,
+        test_other_tab_usable_during_load,
+        test_duplicates_typed_key_equivalence,
+        test_selection_outline_smoke,
+        test_auto_resize_samples_not_full_scan,
     ]
     print("=" * 68)
     print("Lua Table Editor 回归测试")
