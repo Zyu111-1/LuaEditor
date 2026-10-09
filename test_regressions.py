@@ -452,6 +452,40 @@ def test_duplicates_typed_key_equivalence():
     assert not m.is_duplicate(2, 1), "字符串 '1' 不应与数字 1 混同"
     assert not m.is_duplicate(2, 2), "无重复值被误标"
 
+def test_precomputed_aux_from_worker():
+    """worker 预计算（compute_table_aux）→ set_data 复用，行为与同步计算一致。"""
+    from lua_table_editor import compute_table_aux
+    d = LuaParser.parse(FIXTURE_PLAIN)   # v 列值 1,2（无重复）
+    compute_table_aux(d)
+    assert d.dup_counts is not None and d.row_seq_cache is not None
+    m = LuaTableModel()
+    m.set_data(d)
+    assert m._dups_dirty is False, "有预计算时不应再标脏"
+    assert m._row_seq == d.row_seq_cache
+    # 编辑制造重复：v 列（第2列）第二行改成 1 → 与第一行重复
+    m.setData(m.index(1, 2), '1')
+    assert m.is_duplicate(0, 2) and m.is_duplicate(1, 2), "增量更新未标重"
+    # 再改回去 → 重复消失
+    m.setData(m.index(1, 2), '2')
+    assert not m.is_duplicate(0, 2) and not m.is_duplicate(1, 2), "增量更新未去重"
+
+def test_mark_dirty_deferred_rebuild():
+    """结构性变更后 _mark_dups_dirty：行号缓存立即正确，重复值在事件循环后修正。"""
+    d = LuaParser.parse('T = {\n    {id=1, v=7},\n    {id=2, v=7},\n}')
+    m = LuaTableModel()
+    m.set_data(d)
+    assert m.is_duplicate(0, 2) and m.is_duplicate(1, 2)
+    # 模拟注释转换路径：改行类型 + 标脏
+    d.rows[0].row_type = 'comment'
+    d.rows[0].comment_text = '-- x'
+    m._mark_dups_dirty()
+    # 行号缓存立即修正（注释行不占序号）
+    assert m.data(m.index(1, 0), Qt.DisplayRole) == '1', "行号缓存未同步重建"
+    # 事件循环处理后重复值集合重建
+    app.processEvents()
+    assert m._dups_dirty is False, "脏标记未被消费"
+    assert not m.is_duplicate(1, 2), "注释转换后重复值未重建"
+
 def test_selection_outline_smoke():
     """选中描边：块选/整行选/当前格渲染不崩溃（冒烟）。"""
     from PySide6.QtGui import QImage, QPainter
@@ -684,6 +718,8 @@ def main():
         test_open_same_file_while_loading_switches,
         test_other_tab_usable_during_load,
         test_duplicates_typed_key_equivalence,
+        test_precomputed_aux_from_worker,
+        test_mark_dirty_deferred_rebuild,
         test_selection_outline_smoke,
         test_auto_resize_samples_not_full_scan,
     ]

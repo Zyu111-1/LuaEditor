@@ -155,6 +155,11 @@ class LuaTableData:
     # ---- 文件编码/行尾元信息（保存时还原，见 _do_save / LuaLoadWorker）----
     has_bom: bool = False     # 源文件是否带 UTF-8 BOM
     eol: str = os.linesep     # 源文件行尾风格：'\n' / '\r\n' / '\r'
+    # ---- 重复值计数/行号前缀的预计算缓存 ----
+    # 由加载线程（compute_table_aux）解析后顺带算好，LuaTableModel.set_data
+    # 直接复用，避免加载完成瞬间在 UI 线程做 O(N×M) 全表统计导致卡顿。
+    dup_counts: Optional[dict] = None      # {(col, type_name, value): count}
+    row_seq_cache: Optional[list] = None   # 行号前缀缓存（与模型 _row_seq 同构）
 
 
 class LuaTableStr(str):
@@ -164,6 +169,37 @@ class LuaTableStr(str):
     这样 "{build}" 这类"内容像表"的字符串不会丢失引号（BUG-07c），
     而真正的子表值（解析时未带引号）仍以表形式写回。"""
     __slots__ = ()
+
+
+def compute_table_aux(data: 'LuaTableData'):
+    """在工作线程预计算重复值计数与行号前缀缓存。
+
+    只操作纯 Python 数据结构（不碰任何 QObject），因此可以安全地在
+    加载线程中执行。大表的全量统计是 O(N×M)（5 万行×5 列 = 25 万次
+    字典操作），若放在 UI 线程会让加载完成瞬间卡顿数百毫秒；
+    解析完成后顺带算好，set_data 直接复用，实现"填充零重扫"。"""
+    fields = data.field_names
+    counts: dict = {}
+    for row_entry in data.rows:
+        if row_entry.row_type != 'data':
+            continue
+        rd = row_entry.data
+        for c, fn in enumerate(fields):
+            val = rd.get(fn, '')
+            if val is None or val == '':
+                continue
+            # 类型化键：与 LuaTableModel._rebuild_duplicates 保持同一语义
+            key = (c, type(val).__name__, val)
+            counts[key] = counts.get(key, 0) + 1
+    data.dup_counts = counts
+    seq = []
+    n = 0
+    for e in data.rows:
+        seq.append(n)
+        if e.row_type == 'data':
+            n += 1
+    data.row_seq_cache = seq
+    return data
 
 
 # ============================================================================
@@ -834,6 +870,9 @@ class LuaTableModel(QAbstractTableModel):
         # 行号前缀缓存：_row_seq[i] = data.rows[i] 之前出现的数据行数。
         # data() 的行号列直接查表，避免每格做 O(N) 前缀求和（整体 O(N²)，PERF-01）。
         self._row_seq: list = []
+        # 重复值计数（持久维护，编辑时增量更新，避免每次编辑全表重扫）
+        self._dup_counts: dict = {}   # {(col, type_name, value): count}
+        self._dups_dirty: bool = False  # 结构性变更后待全量重建的标记
 
     def safe_notify_reset(self):
         """安全刷新模型视图：beginResetModel/endResetModel 配对，防重入"""
@@ -852,7 +891,18 @@ class LuaTableModel(QAbstractTableModel):
         self._headers = ['#'] + data.field_names if data else []
         self._undo_stack.clear()
         self._redo_stack.clear()
-        self._rebuild_duplicates()
+        # 优先复用加载线程的预计算结果（compute_table_aux）：大表全量统计
+        # 是百毫秒级操作，绝不能在建表瞬间同步做。无预计算时（新建表/
+        # 测试直接 set_data）同步计算，小表无感。
+        if data is not None and data.dup_counts is not None \
+                and data.row_seq_cache is not None:
+            self._dup_counts = data.dup_counts
+            self._duplicate_set = {
+                k: True for k, c in data.dup_counts.items() if c >= 2}
+            self._row_seq = list(data.row_seq_cache)
+            self._dups_dirty = False
+        else:
+            self._rebuild_duplicates()
         self.endResetModel()
 
     @property
@@ -914,7 +964,7 @@ class LuaTableModel(QAbstractTableModel):
 
         行的 row_type 会被就地修改（注释/取消注释、填充柄把空行转数据行），
         因此除增删行外，这些路径也必须刷新本缓存——统一挂在
-        _rebuild_duplicates() 里同步执行，另在 endInsertRows/endRemoveRows
+        _mark_dups_dirty() 里同步执行，另在 endInsertRows/endRemoveRows
         中兜底。"""
         seq = []
         n = 0
@@ -934,33 +984,67 @@ class LuaTableModel(QAbstractTableModel):
         self._rebuild_row_seq()
 
     def _rebuild_duplicates(self):
-        """重建重复值集合，用于高亮显示（同时刷新行号前缀缓存）"""
+        """全量重建重复值计数（同时刷新行号前缀缓存）。
+
+        大表 O(N×M)。只应在：set_data（有 worker 预计算兜底）与
+        _refresh_duplicates（延迟批量刷新）中调用；常规编辑走
+        _dup_count_adjust 增量更新，结构性变更走 _mark_dups_dirty。"""
         self._rebuild_row_seq()
-        self._duplicate_set.clear()
-        if not self._data:
-            return
-        fields = self._data.field_names
-        # 统计每列每个值的出现次数。
-        # 重复判定键用 (类型名, 原值) 而不是 _value_to_lua()：后者对每个
-        # 字符串做逐字符转义，万行×多列的表会执行百万级字符操作，是
-        # 大表加载卡顿的主热点之一。类型化键语义等价——int/float/bool/
-        # str/LuaTableStr(子表表达式) 各自成组，与 _value_to_lua 的分组
-        # 结果一一对应（'1' 与 1 不会混同：str 键带类型名隔离）。
         counts: dict = {}  # {(col, type_name, value): count}
-        for row_entry in self._data.rows:
-            if row_entry.row_type != 'data':
-                continue
-            rd = row_entry.data
-            for c, fn in enumerate(fields):
-                val = rd.get(fn, '')
-                if val is None or val == '':
+        if self._data:
+            fields = self._data.field_names
+            for row_entry in self._data.rows:
+                if row_entry.row_type != 'data':
                     continue
-                key = (c, type(val).__name__, val)
-                counts[key] = counts.get(key, 0) + 1
-        # 只保留出现次数 >= 2 的项
-        for key, cnt in counts.items():
+                rd = row_entry.data
+                for c, fn in enumerate(fields):
+                    val = rd.get(fn, '')
+                    if val is None or val == '':
+                        continue
+                    # 类型化键语义：int/float/bool/str/LuaTableStr(子表
+                    # 表达式) 各自成组，'1' 与 1 不会混同
+                    key = (c, type(val).__name__, val)
+                    counts[key] = counts.get(key, 0) + 1
+        self._dup_counts = counts
+        self._duplicate_set = {k: True for k, c in counts.items() if c >= 2}
+        self._dups_dirty = False
+
+    def _mark_dups_dirty(self):
+        """结构性变更（批量粘贴/注释转换/填充等）后的重复值刷新。
+
+        延迟到事件循环空闲一次性全量重建，避免大批量操作时逐次重扫；
+        行号缓存同步重建（O(N) 便宜且影响行号显示正确性）。脏窗口期内
+        is_duplicate 可能短暂用旧集合——只影响高亮，不影响数据。"""
+        self._rebuild_row_seq()
+        self._dups_dirty = True
+        QTimer.singleShot(0, self._refresh_duplicates)
+
+    def _refresh_duplicates(self):
+        if self._dups_dirty:
+            self._rebuild_duplicates()
+            # 触发可见区域重绘，让新算出的重复值高亮立即生效
+            if self.rowCount() > 0 and self.columnCount() > 0:
+                self.dataChanged.emit(
+                    self.index(0, 0),
+                    self.index(self.rowCount() - 1, self.columnCount() - 1))
+
+    def _dup_count_adjust(self, col: int, val, delta: int):
+        """增量维护重复值计数（单格编辑路径专用，O(1)）"""
+        if val is None or val == '':
+            return  # 空值不参与计数
+        key = (col, type(val).__name__, val)
+        cnt = self._dup_counts.get(key, 0) + delta
+        if cnt <= 0:
+            self._dup_counts.pop(key, None)
+            self._duplicate_set.pop(key, None)
+        else:
+            self._dup_counts[key] = cnt
+            # 计数跨越 2 的阈值双向维护：>=2 入集合，<2 必须移除
+            # （否则"改走重复值后高亮残留"）
             if cnt >= 2:
                 self._duplicate_set[key] = True
+            else:
+                self._duplicate_set.pop(key, None)
 
     def is_duplicate(self, row: int, col: int) -> bool:
         """检查指定单元格的值是否为重复值"""
@@ -1209,10 +1293,31 @@ class LuaTableModel(QAbstractTableModel):
             row_entry.data[fn] = parsed
             row_entry._dirty = True
             self._data.modified = True
-            self._rebuild_duplicates()
-            # 发整列信号，让同行其他重复值也刷新高亮
-            top_left = self.index(0, col)
-            bottom_right = self.index(self.rowCount() - 1, col)
+            # 增量更新重复值计数（旧值-1，新值+1）：此前每次编辑都全表
+            # 重扫 O(N×M)，大表下每个按键都卡顿
+            if self._dups_dirty:
+                self._rebuild_duplicates()   # 脏窗口期内直接全量修正
+                full_col = True
+            else:
+                ok_key = lambda v: (None if v is None or v == ''
+                                    else (col - 1, type(v).__name__, v))
+                old_key, new_key = ok_key(old_val), ok_key(parsed)
+                dup_old_before = bool(old_key) and self._duplicate_set.get(old_key, False)
+                dup_new_before = bool(new_key) and self._duplicate_set.get(new_key, False)
+                self._dup_count_adjust(col - 1, old_val, -1)
+                self._dup_count_adjust(col - 1, parsed, +1)
+                dup_old_after = bool(old_key) and self._duplicate_set.get(old_key, False)
+                dup_new_after = bool(new_key) and self._duplicate_set.get(new_key, False)
+                # 只有重复状态跨越阈值（本值/新值从重复↔不重复）才需要
+                # 刷新整列其他同值单元格；否则整列 dataChanged 会让视图
+                # 在大表上迭代数万行，每次编辑都卡
+                full_col = (dup_old_before != dup_old_after) or \
+                           (dup_new_before != dup_new_after)
+            if full_col:
+                top_left = self.index(0, col)
+                bottom_right = self.index(self.rowCount() - 1, col)
+            else:
+                top_left = bottom_right = index
             self.dataChanged.emit(top_left, bottom_right)
             return True
         return False
@@ -1307,7 +1412,7 @@ class LuaTableModel(QAbstractTableModel):
             self._redo_stack.append((row, -1, current_entry))
             self._data.rows[row] = old_val
             self._data.modified = True
-            self._rebuild_duplicates()
+            self._mark_dups_dirty()
             self.safe_notify_reset()
             self._finalize_undo_redo()
             return True
@@ -1351,7 +1456,7 @@ class LuaTableModel(QAbstractTableModel):
 
         self._redo_stack.append((row, col, current))
         self._data.modified = True
-        self._rebuild_duplicates()
+        self._mark_dups_dirty()
         idx = self.index(row, col)
         self.dataChanged.emit(idx, idx)
         self._finalize_undo_redo()
@@ -1378,7 +1483,7 @@ class LuaTableModel(QAbstractTableModel):
             self._undo_stack.append((row, -1, current_entry))
             self._data.rows[row] = new_val
             self._data.modified = True
-            self._rebuild_duplicates()
+            self._mark_dups_dirty()
             self.safe_notify_reset()
             self._finalize_undo_redo()
             return True
@@ -1419,7 +1524,7 @@ class LuaTableModel(QAbstractTableModel):
 
         self._undo_stack.append((row, col, current))
         self._data.modified = True
-        self._rebuild_duplicates()
+        self._mark_dups_dirty()
         idx = self.index(row, col)
         self.dataChanged.emit(idx, idx)
         return True
@@ -2575,7 +2680,7 @@ class LuaTableView(QTableView):
         # 通知视图更新填充区域（转换 data.rows 索引 → 逻辑行号）
         # 填充可能就地把空行转成数据行（row_type 变化影响行号前缀缓存与
         # 重复值集合），统一重建
-        src._rebuild_duplicates()
+        src._mark_dups_dirty()
         if len(data.rows) > last_data_idx:
             first_visual = last_data_idx + 1 + hc
             last_visual = min(last_data_idx + n, len(data.rows) - 1) + hc
@@ -3820,6 +3925,9 @@ class LuaLoadWorker(QThread):
             data.modified = False
             data.non_undoable_modified = False
             data.file_mtime = os.path.getmtime(self._file_path)
+            # 重复值计数/行号缓存在本线程预计算（纯 Python 数据，
+            # 不碰 Qt 对象），UI 线程建表时零重扫
+            compute_table_aux(data)
             self.signals.finished.emit(data, self._file_path)
         except Exception as e:  # 解析/读取异常统一回传
             self.signals.error.emit(str(e))
@@ -4789,7 +4897,9 @@ class MainWindow(QMainWindow):
             lambda msg, t=td, cb=on_loaded, a=auto:
                 self._on_tab_load_error(t, msg, cb, a))
         worker.finished.connect(lambda w=worker: self._on_worker_done(w))
-        worker.start()
+        # 低优先级运行：解析是纯 Python（受 GIL 约束），低优先级让事件
+        # 循环/渲染线程在争抢 GIL 时优先胜出，加载期间界面保持跟手
+        worker.start(QThread.LowPriority)
 
     def _on_tab_data_ready(self, td, data, file_path, on_loaded, auto):
         """worker 解析完成（主线程）：标签页存活才回调，随后结束加载态"""
@@ -5332,7 +5442,7 @@ class MainWindow(QMainWindow):
             model.safe_notify_reset()
 
         data.modified = True
-        model._rebuild_duplicates()
+        model._mark_dups_dirty()
         self._update_statusbar()
         self._update_tab_title()
 
@@ -5385,7 +5495,7 @@ class MainWindow(QMainWindow):
                         data.rows[data_idx].data[fn] = val
             model.safe_notify_reset()
             data.modified = True
-            model._rebuild_duplicates()
+            model._mark_dups_dirty()
             self._update_statusbar()
             return
 
@@ -5458,7 +5568,7 @@ class MainWindow(QMainWindow):
             model.safe_notify_reset()
 
         data.modified = True
-        model._rebuild_duplicates()
+        model._mark_dups_dirty()
         self._update_statusbar()
         self._update_tab_title()
 
@@ -5563,7 +5673,7 @@ class MainWindow(QMainWindow):
 
             model.safe_notify_reset()
             data.modified = True
-            model._rebuild_duplicates()
+            model._mark_dups_dirty()
             self._update_statusbar()
             self._update_tab_title()
             return
@@ -5578,7 +5688,7 @@ class MainWindow(QMainWindow):
                 data.rows[data_idx].data[data.field_names[0]] = LuaParser._parse_value(text) if data.field_names else text
                 model.safe_notify_reset()
                 data.modified = True
-                model._rebuild_duplicates()
+                model._mark_dups_dirty()
                 self._update_statusbar()
                 self._update_tab_title()
 
@@ -5736,7 +5846,7 @@ class MainWindow(QMainWindow):
 
         data.modified = True
         data.non_undoable_modified = True  # 批量同步不可撤销
-        model._rebuild_duplicates()
+        model._mark_dups_dirty()
         model.safe_notify_reset()
         self._update_tab_title()
         self._update_statusbar()
@@ -5822,7 +5932,7 @@ class MainWindow(QMainWindow):
             row_entry._dirty = True
             data.modified = True
             model.safe_notify_reset()
-            model._rebuild_duplicates()
+            model._mark_dups_dirty()
             self._update_statusbar()
             self._update_tab_title()
         except Exception:
@@ -5866,7 +5976,7 @@ class MainWindow(QMainWindow):
             row_entry._dirty = True
             data.modified = True
             model.safe_notify_reset()
-            model._rebuild_duplicates()
+            model._mark_dups_dirty()
             self._update_statusbar()
             self._update_tab_title()
         except Exception:
@@ -5946,7 +6056,7 @@ class MainWindow(QMainWindow):
             data.rows[row] = RowEntry(row_type='comment', comment_text=comment_text, row_key=entry.row_key)
 
         # 通知视图刷新受影响的区域（dataChanged 需要逻辑行号，加回表头偏移）
-        model._rebuild_duplicates()
+        model._mark_dups_dirty()
         hc = model._header_count
         top_left = model.index(min(rows_to_comment) + hc, 0)
         bottom_right = model.index(max(rows_to_comment) + hc, model.columnCount() - 1)
@@ -6013,7 +6123,7 @@ class MainWindow(QMainWindow):
             return
 
         # 通知视图刷新（dataChanged 需要逻辑行号，加回表头偏移）
-        model._rebuild_duplicates()
+        model._mark_dups_dirty()
         hc = model._header_count
         top_left = model.index(min(rows_to_uncomment) + hc, 0)
         bottom_right = model.index(max(rows_to_uncomment) + hc, model.columnCount() - 1)
