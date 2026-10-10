@@ -2,9 +2,10 @@
 
 > **Target:** AI coding agents for reading, understanding, and maintaining this codebase.
 > **Language:** Chinese (project context) / English (code identifiers)
-> **Version:** 1.0
-> **Generated:** 2026-07-03
-> **Entry Point:** `lua_table_editor.py` (4932 lines, single-file PySide6 desktop app)
+> **Version:** 2.0
+> **Generated:** 2026-10-10（v1.0 初版；v2.0 反映 P1 缺陷修复、Theme 美化、每标签页独立加载、大表性能优化后的现状）
+> **Entry Point:** `lua_table_editor.py` (~6050 lines, single-file PySide6 desktop app)
+> **Latest status:** 见 `HANDOFF.md` 顶部状态快照；回归测试 `python test_regressions.py`（37 项，offscreen headless）
 
 ---
 
@@ -127,6 +128,7 @@ Settings stored via `QSettings("LuaTableEditor", "LuaTableEditor")`:
 - `recentFiles` — list of paths (max 8)
 - `workspaceFolders` — list of `{path, color}` dicts
 - `fileNotes` — dict `{file_path: note_text}`
+- `autoRefresh` — bool, 定时自动刷新开关（启动时恢复）
 
 ---
 
@@ -137,7 +139,7 @@ Settings stored via `QSettings("LuaTableEditor", "LuaTableEditor")`:
 ```python
 @dataclass
 class RowEntry:
-    row_type: str = "data"       # "data" | "comment"
+    row_type: str = "data"       # "data" | "comment" | "blank"
     comment_text: str = ""       # comment text (only when row_type=="comment")
     data: dict = field(...)      # {field_name: parsed_value} (only when row_type=="data")
     row_key: str = ""            # Lua table key, e.g. "1", "101", "'name'"
@@ -154,13 +156,23 @@ class LuaTableData:
     header_comments: list = []   # lines BEFORE the table declaration (e.g. "-- xxx.xlsx")
     is_local: bool = False       # whether table uses "local Name = {" syntax
     return_var: str = ""         # e.g. "data" for "return data" at file end
+    # ---- v2.0 新增 ----
+    non_undoable_modified: bool  # 存在过不可撤销修改（增删行/列、粘贴等）；
+                                 # _finalize_undo_redo 只有它为 False 才允许复位 modified
+    has_bom: bool                # 源文件 UTF-8 BOM（保存时还原）
+    eol: str                     # 源文件行尾 '\n'/'\r\n'/'\r'（内部统一 LF，保存时还原）
+    dup_counts: dict | None      # worker 预计算的重复值计数（compute_table_aux 填充）
+    row_seq_cache: list | None   # worker 预计算的行号前缀缓存
 ```
 
+另有 `class LuaTableStr(str)`：解析自**未加引号**表表达式的值（如 `{1,2,3}`），序列化时裸写不加引号；普通 `str` 一律加引号——这是"字符串 `\"{build}\"` 不丢引号"的关键区分标记。
+
 **Critical invariants:**
-- `data.rows` contains ONLY inline comments and data rows — NOT `header_comments`.
-- `row_key == ""` → serialized as anonymous `{...}`
-- `row_key != ""` → serialized as `[key] = {...}`
+- `data.rows` contains ONLY inline comments, blank rows and data rows — NOT `header_comments`.
+- `row_key == ""` → serialized as anonymous `{...}`；匿名数组表（无任何数字行键）新增行保持匿名（强赋 `[1]` 会覆盖第 1 个数组元素）。
+- `row_key != ""` → serialized as `[key] = {...}`；字符串键由 `_row_key_to_lua` 自动加引号（`[my_key]` → `["my_key"]`）。
 - `field_names[0]` is always `"id"` if `id` exists in any row.
+- `blank` 行不可编辑/删除，序列化固定输出空行（原地保留原文）。
 
 ### 3.2 LuaParser (Lines 67–419)
 
@@ -281,6 +293,7 @@ Logical Row Layout:
 ROW_HEADER_COMMENT = 'header_comment'  # header comments (non-data, non-editable)
 ROW_DATA           = 'data'            # data rows
 ROW_INLINE_COMMENT = 'inline_comment'  # inline comments within data.rows[]
+ROW_BLANK          = 'blank'           # blank lines (non-editable, kept verbatim)
 ROW_RETURN         = 'return'          # "return data" line
 ```
 
@@ -311,24 +324,48 @@ Methods:
 - `push_row_undo(row, old_entry)` — used by comment/uncomment operations
 - `has_undo()` / `has_redo()` — check availability
 
-#### 3.4.4 Duplicate Detection
+#### 3.4.4 Duplicate Detection（v2.0 重构：持久计数 + 三条维护路径）
 
-`_rebuild_duplicates()` — O(N*M) scan:
-- For each data row, collect `(col_index, serialized_value)`
-- Count occurrences across all rows
-- Mark as duplicate if count ≥ 2
-- Used by delegate for visual highlighting (orange-red text + marker bar)
+计数键为 **`(col, type(val).__name__, val)`**（类型化键，与 `_value_to_lua` 分组语义等价，但无逐字符转义开销）。持久存储在 `LuaTableModel._dup_counts`，派生集合 `_duplicate_set`（count≥2）。
+
+| 路径 | 触发场景 | 方法 | 代价 |
+|------|---------|------|------|
+| worker 预计算 | 打开/刷新文件 | `compute_table_aux(data)` 在加载线程执行，`set_data` 复用 | UI 零重扫 |
+| 增量更新 | 单格编辑 `setData` | `_dup_count_adjust(col, val, ±1)`（跨阈值时才发整列 dataChanged） | O(1) |
+| 延迟全量 | 结构性变更（粘贴/注释转换/填充/撤销） | `_mark_dups_dirty()` → 行号缓存同步重建，计数在事件循环空闲由 `_refresh_duplicates()` 全量重建 | 一次 O(N×M) |
+
+**规则**：就地修改 `row_type` 后必须调用 `_mark_dups_dirty()`（不要直接调 `_rebuild_duplicates()`，它不会安排延迟刷新与重绘）。
 
 #### 3.4.5 Row Insertion
 
 | Method | Batch Signal | Purpose |
 |--------|-------------|---------|
 | `add_data_row(pos)` | Single `beginInsertRows` | Add 1 data row at logical position |
-| `add_data_rows_batch(count, pos)` | Single `beginInsertRows` for all | Add N data rows efficiently |
+| `add_data_rows_batch(count, pos)` | Single `beginInsertRows` for all | Add N data rows efficiently（键连续递增，单次求最大值） |
 | `add_comment_row(pos)` | Single `beginInsertRows` | Add 1 comment row |
-| `remove_row(row)` | `beginRemoveRows` | Delete row (rejects header/return rows) |
+| `remove_row(row)` | `beginRemoveRows` | Delete row (rejects header/return/blank rows) |
 
 All `pos` parameters are logical row indices. Internal conversion to `data.rows` index uses `_logical_to_data_row()`.
+
+**Modified-flag rule:** 以上方法及粘贴/填充/修复行键等所有**不可撤销**的结构性修改，必须同时置 `data.non_undoable_modified = True`——否则"加行→改格→撤销"会把未保存数据伪装成已保存（BUG-02）。
+
+### 3.4A Per-Tab Loading Pipeline（v2.0，替代全局加载锁）
+
+```
+_open_file_path(path)
+  ├─ 已打开/加载中/失败占位 → 切换（失败占位可原位重试 _reset_placeholder）
+  └─ _create_loading_tab(path)          # 立即可见的 ⏳ 占位页
+       └─ _start_load(path, td, cb)     # td['loading']=True，_active_loads 登记
+            └─ LuaLoadWorker.run（QThread.LowPriority）
+                 ├─ 读盘（newline=''，检测 BOM/行尾）→ LuaParser.parse
+                 └─ compute_table_aux(data)  # 重复值计数+行号缓存预计算
+                      └─ _on_tab_data_ready → _finalize_tab_load（主线程）
+                           └─ _build_tab_content(td)  # set_data 复用预计算，UI 零重扫
+```
+
+- **无全局锁**：`td['loading']` 是单页互斥位，多文件并发加载互不影响；`_active_loads` 仅驱动状态栏进度条。
+- `_get_current_tab_data()` 对占位/加载中页返回 `None`（下游操作自动 no-op）；操作"可能加载中"的标签页须用原始 `_tabs_data` 查找并 `.get()` 防护。
+- 加载失败：占位页就地显示错误并保留（`load_failed=True`），重开同路径文件原位重试。
 
 ### 3.5 FilterProxyModel (Lines 1354–1453)
 
@@ -514,18 +551,23 @@ LuaTableData (1) ──── (N) RowEntry
 Each open tab is tracked in `MainWindow._tabs_data[id(widget)]`:
 ```python
 {
-    'data': LuaTableData,        # current data instance
-    'model': LuaTableModel,      # Qt model (source)
-    'proxy': FilterProxyModel,   # Qt proxy (filter/sort)
-    'view': LuaTableView,        # Qt view widget
+    'data': LuaTableData | None, # current data instance (None while placeholder)
+    'model': LuaTableModel | None,
+    'proxy': FilterProxyModel | None,
+    'view': LuaTableView | None,
     'tab': QWidget,              # tab container widget
     'title': str,                # base filename
     'display_title': str,        # full title with path
     'file_path': str,            # absolute path
+    'loading': bool,             # worker in flight (per-tab mutex)
+    'placeholder': bool,         # True until real table is built
+    'load_failed': bool,         # placeholder error state (retry on reopen)
+    'page': QWidget | None,      # placeholder loading page widget
     'workspace_folder': str,     # matching workspace folder
     'workspace_color': str,      # matching workspace color hex
 }
 ```
+占位页阶段 model/proxy/view 为 `None`；`_get_current_tab_data()` 对此类页返回 `None`。
 
 ### 4.5 Workspace Data
 
@@ -549,8 +591,8 @@ DEFAULT_COLORS = [
 
 | Operation | Trigger | Function | Notes |
 |-----------|---------|----------|-------|
-| Open file | `Ctrl+O`, DnD, toolbar, welcome | `_open_file()` → `_open_file_path()` | Parses via LuaParser, creates tab |
-| Save | `Ctrl+S` | `_save_file()` → `_do_save(path)` | Serializes via LuaSerializer |
+| Open file | `Ctrl+O`, DnD, toolbar, welcome | `_open_file()` → `_open_file_path()` | 每标签页独立后台加载（见 §3.4A），占位页→worker 解析→原位填充 |
+| Save | `Ctrl+S` | `_save_file()` → `_do_save(path)` | Serializes via LuaSerializer；临时文件原子替换，BOM/行尾还原 |
 | Save As | `Ctrl+Shift+S` | `_save_file_as()` | Prompts for path |
 | Refresh | `F5` | `_refresh_file()` | Re-reads from disk, warns on unsaved |
 | Close tab | `Ctrl+W` | `_close_tab()` | Prompts save if modified |
@@ -604,8 +646,8 @@ DEFAULT_COLORS = [
 ### 5.6 Drag & Drop
 
 MainWindow accepts file drops:
-- `dragEnterEvent`: accepts if any URL ends with `.lua`
-- `dropEvent`: calls `_open_file_path()` for first `.lua` file
+- `dragEnterEvent`: accepts if any URL ends with `.lua`（不区分大小写）
+- `dropEvent` → `_open_files(paths)` → 逐个 `_open_file_path()`：每标签页独立并发加载，互不阻塞
 
 ### 5.7 Welcome Page
 
@@ -628,32 +670,40 @@ Filtering active: appends `"| 显示: N 行 (已筛选)"`.
 
 | Limitation | Details |
 |------------|---------|
-| **No nested table editing** | Subtable values `{a=1,b=2}` are stored as raw strings, not editable as structured data |
+| **No nested table editing** | Subtable values `{a=1,b=2}` are stored as `LuaTableStr` raw strings, not editable as structured data |
 | **Field name constraints** | Field names extracted only from `key=value` pairs (not `[key]=value` bracket notation) |
-| **Single-file architecture** | ~4932 lines in one file; no module separation |
-| **No async I/O** | File loading uses `QApplication.processEvents()` for progress bar; large files may briefly block UI |
+| **Single-file architecture** | ~6050 lines in one file; no module separation |
 | **CSV/Excel import** | Not supported; only Lua table format |
 | **No versioning/git integration** | Undo is in-memory only, cleared on file open/close |
 | **Field order determined by first occurrence** | If a field first appears in row 5, it is ordered based on row 5, not row 1 |
-| **`[string_key]` not fully preserved** | Bracket notation with string keys like `['myKey']` is parsed as row_key but handling is limited |
+| **Unquoted identifier values** | `kind=SomeEnum` 解析为字符串，重新生成时带引号输出（引号信息解析时即丢失） |
+| **Parse performance** | 解析为纯 Python（GIL 约束），5 万行约 4~5s，期间 UI 保持响应但 CPU 占用高 |
 
 ### 6.2 Constants Reference
 
 ```python
+# Theme（v2.0：全部 UI 颜色常量的唯一来源，P4 美化入口）
+Theme.ACCENT / SURFACE / SELECTION / SEL_ROW / SEL_COL / SEL_CROSS / SEL_BORDER
+Theme.DUP_BG / DUP_TEXT / DUP_MARKER        # 重复值
+Theme.CMT_* / HDR_CMT_* / RET_*             # 注释与结构行语义色
+# ... 完整清单见 lua_table_editor.py 顶部 class Theme
+
 # Delegate
-LuaTableDelegate.MAX_CHARS = 40         # max visible chars per cell
+LuaTableDelegate.MAX_CHARS = 40             # max visible chars per cell
+
+# MainWindow
+MainWindow.RESIZE_SAMPLE_ROWS = 300         # 列宽自适应抽样行数（勿改回全表测量）
+MainWindow._CLIPBOARD_MIME = 'application/x-luatable-rows'
 
 # Workspace
-WorkspacePanel.DEFAULT_COLORS = [...]    # 8 preset workspace colors
-
-# Clipboard
-MainWindow._CLIPBOARD_MIME = 'application/x-luatable-rows'
+WorkspacePanel.DEFAULT_COLORS = [...]       # 8 preset workspace colors
 
 # Row Types
 LuaTableModel.ROW_HEADER_COMMENT = 'header_comment'
-LuaTableModel.ROW_DATA = 'data'
+LuaTableModel.ROW_DATA           = 'data'
 LuaTableModel.ROW_INLINE_COMMENT = 'inline_comment'
-LuaTableModel.ROW_RETURN = 'return'
+LuaTableModel.ROW_BLANK          = 'blank'
+LuaTableModel.ROW_RETURN         = 'return'
 
 # Filter Modes
 FilterProxyModel._filter_mode: "equals" | "not_equals" | "contains" | "not_contains"
@@ -689,26 +739,29 @@ _recent_files[:8]
 
 ### 6.5 Testing
 
-**`_test_rowkey.py`**: Standalone test script that:
-- Creates a minimal Qt mock (so `LuaParser` and `LuaSerializer` can be imported without PySide6)
-- Parses a test Lua string with `[1]=` through `[11]=` and `[7202]=`, `[7302]=` entries
-- Verifies all `row_key` values are preserved through parse→serialize round-trip
+**`test_regressions.py`**（v2.0 唯一有效测试，37 项，offscreen headless，无需显示环境）：
+- 序列化层：零 diff、最小 diff、幂等（`parse→serialize→写盘→再 parse→再 serialize` 第二轮字节一致）、BOM/CRLF 还原、行键引号、转义
+- 模型层：modified 语义（BUG-02）、空行不可编辑、行号缓存、筛选越界、增量/预计算重复值
+- 主窗口层：带表头注释的注释/取消注释、插入位置、粘贴安全、独立加载（占位页/并发/重复打开）、选区描边冒烟、抽样列宽
 
-Run: `python _test_rowkey.py`
+Run: `python test_regressions.py`（全部通过输出 `ALL PASSED`，失败非零退出）
+
+**禁止**使用已过时的 `_test_rowkey.py` / `_gui_flow_test.py`（mock PyQt5，与现状不符，仅作历史参考）。
 
 ### 6.6 Visual Style Guide
 
-| Element | Color | Purpose |
-|---------|-------|---------|
-| Header comments | `#006600` (dark green), italic, `#f5f5ee` bg | File-level comments |
-| Inline comments | `#666666` (gray), italic, `#f0f0e8` bg | Row-level comments |
-| Return line | `#800080` (purple), italic, `#f0e8f5` bg | `return data` |
-| Row numbers | `#888888` (light gray) | Row index column |
-| Duplicate values | `#c0392b` text, `#ffe8e0` bg, `#e8836b` marker | Duplicate detection |
-| Selection | `#a8d4f0` (light blue) bg | Selected cells |
-| Highlight (row/col) | `#d8eafc` bg | Current cell highlight |
-| Fill handle | `#2980b9` (normal), `#42A5F5` (hover) | Drag fill indicator |
+**v2.0 起所有颜色统一收敛在 `class Theme`（文件顶部常量类），禁止在代码里散落十六进制色值。** 语义要点：
+
+| Element | Theme 常量 | Purpose |
+|---------|-----------|---------|
+| Header comments | `HDR_CMT_BG` / `HDR_CMT_TEXT`（绿系） | File-level comments |
+| Inline comments | `CMT_BG` / `CMT_TEXT`（灰） | Row-level comments |
+| Return line | `RET_BG` / `RET_TEXT`（紫） | `return data` |
+| Duplicate values | `DUP_BG` / `DUP_TEXT` / `DUP_MARKER` | Duplicate detection |
+| Selection | `SELECTION` / `SEL_ROW` / `SEL_COL` / `SEL_CROSS` | 选中/整行/整列/交叉 |
+| Selection outline | `SEL_BORDER` | 选区外沿描边（`_draw_selection_outline`） |
+| Focus cell | `FOCUS` | 当前格焦点框 |
+| Fill handle | `FILL` / `FILL_BORDER` / `FILL_HOVER` | Drag fill indicator |
 | Tab modified | `*` prefix on tab title | Unsaved changes indicator |
 | Workspace stripe | User-chosen color, 3px bar | Tab belongs to workspace |
-| Toolbar | `#e8e8e0` bg, white buttons | Top toolbar area |
-| Status bar | `#e8e8e0` bg | Bottom status area |
+| Loading placeholder | `SURFACE` 底 + `TEXT_MUTED` 文字 | 每标签页独立加载占位页 |

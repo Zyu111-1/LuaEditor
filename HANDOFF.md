@@ -7,7 +7,32 @@
 
 ---
 
-## ★ 修复状态快照（2026-09-24，P1 批次已完成）
+## ★ 状态更新（2026-10-10，P2/P4/性能批次已完成，最新快照）
+
+> 本节为**最新事实**，与下方 09-24 快照冲突时以本节为准。
+
+**已完成批次**：P1 缺陷修复（09-24）→ P2 样式常量抽取 + P4 界面美化（Theme 主题）→ 每标签页独立加载 + 选区描边（10-09）→ 大表加载/编辑性能优化（10-10）。回归测试 **37/37 通过**（`python test_regressions.py`，offscreen headless）。全部提交已推送到 `origin/feature/rowkey-sync-load-refresh`。
+
+**本次引入的机制（后续修改必须了解，替代下方旧快照中的过时条目）**：
+- **每标签页独立加载**（无全局锁）：打开文件 → `_create_loading_tab` 占位页（⏳）→ `LuaLoadWorker`（**LowPriority** 线程）解析 + `compute_table_aux` 预计算 → `_finalize_tab_load` 原位填充。标签页状态标志：`td['loading']`（worker 在途互斥位）、`td['placeholder']`（是否占位页）、`td['load_failed']`（失败可原位重试）。`MainWindow._active_loads` 仅用于状态栏进度指示。**旧的 `_pending_opens`/`_drain_pending_opens`/全局 `_loading` 已删除**。
+- `_get_current_tab_data()` 对占位/加载中标签页返回 **None**——所有依赖 `td['view']/td['data']` 的操作自动 no-op；需要操作"可能加载中"的标签页时用原始 `_tabs_data` 查找并自行 `.get()` 防护。
+- **重复值计数持久化**：`LuaTableModel._dup_counts`（键 `(col, type_name, value)`）。单格编辑走 `_dup_count_adjust` 增量更新；结构性变更走 `_mark_dups_dirty()`（行号缓存同步重建，计数延迟到事件循环空闲由 `_refresh_duplicates` 全量重建）。**就地改 row_type 后必须调用 `_mark_dups_dirty()`（不是 `_rebuild_duplicates()`）**。
+- **worker 预计算**：`LuaLoadWorker.run` 解析后调用 `compute_table_aux(data)` 填充 `data.dup_counts`/`data.row_seq_cache`；`set_data` 优先复用，避免建表瞬间在 UI 线程做 O(N×M) 统计。
+- **按需整列信号**：`setData` 只在重复状态跨阈值时发整列 `dataChanged`，否则单格（大表编辑 0.17ms）。
+- `Theme` 类：全部 UI 颜色常量（P4 美化统一入口），新增 `SEL_BORDER`（选区描边）。
+- 选区描边：`LuaTableDelegate._draw_selection_outline`，只画选区外沿（相邻未选中格的边）。
+- 列宽自适应：`MainWindow._auto_resize_columns` 抽样前 `RESIZE_SAMPLE_ROWS=300` 行测量，**不要改回 `ResizeToContents`**（大表全表测量会卡死）。
+- 性能量级（5 万行 / 3.9MB 实测）：加载全程 UI 最长阻塞 ~120ms、单格编辑 0.17ms、滚动 8ms、加行 9ms。
+
+**修复后仍遗留（未处理，后续批次）**：
+- BUG-21（`_get_brace_content` 的 rfind 边界）、BUG-22（Lua 长字符串 `[[...]]`）、BUG-23（重复值误报，属设计取舍）、BUG-24（混合键类型的默认键）、BUG-28（未编辑的新建表关闭无提示）、BUG-30（工作区递归无符号链接保护/自然排序）、BUG-31（冻结浮层重建开销）。
+- PERF-04（`lru_cache` 缓存整行原文）。
+- §5 的全部 MISSING 功能项（排序、查找替换、导入导出等）与 §4.1 的结构重构。
+- 已知语义限制（未修，原样保留）：未加引号的标识符值（如 `kind=SomeEnum`）在行被重新生成时会变成 `"SomeEnum"` 字符串——引号信息在解析时即丢失，修复需改值表示方式。
+
+---
+
+## ★ 修复状态快照（2026-09-24，P1 批次已完成；机制描述部分已被上方 10-10 快照取代）
 
 P1-A / P1-B 的功能缺陷修复已全部落地，回归测试 **29/29 通过**（`python test_regressions.py`）。
 真实数据端到端冒烟（`biaodan/ClothData.lua` 临时副本，1MB / 1307 行 / CRLF）：加载→改值→保存→重载→再序列化 **字节级幂等**，CRLF 无二次翻译。
@@ -23,9 +48,9 @@ P1-A / P1-B 的功能缺陷修复已全部落地，回归测试 **29/29 通过**
 - `LuaTableData.non_undoable_modified`：所有不可撤销的修改（增删行/列、粘贴、修复/批量同步行键、填充追加行）必须置 True；`_finalize_undo_redo` 只有它为 False 时才允许复位 `modified`。
 - `LuaTableData.has_bom` / `eol`：文件级元信息。内部文本统一 LF；读取（worker，`newline=''`）时检测真实行尾，保存（`_do_save`，`newline=''` + 临时文件原子替换）时还原。
 - `LuaTableStr(str)`：解析自未加引号表表达式的值；序列化时裸写。普通 str 一律加引号。
-- `LuaTableModel._row_seq`：行号前缀缓存，随 `_rebuild_duplicates()` 与 `endInsertRows/endRemoveRows` 自动刷新；就地改 `row_type` 后必须调用 `_rebuild_duplicates()`。
+- `LuaTableModel._row_seq`：行号前缀缓存，随 `_rebuild_duplicates()` 与 `endInsertRows/endRemoveRows` 自动刷新；就地改 `row_type` 后必须调用 `_rebuild_duplicates()`。（10-10 更新：日常路径改用 `_mark_dups_dirty()`，见上方快照）
 - `LuaTableModel.ROW_BLANK`：空行类型，不可编辑、不可删除、不占数据序号。
-- `MainWindow._pending_opens` + `_drain_pending_opens`：多文件拖放排队。
+- ~~`MainWindow._pending_opens` + `_drain_pending_opens`：多文件拖放排队。~~（10-10 已删除：多文件拖放直接并发独立加载）
 
 **修复后仍遗留（未处理，后续批次）**：
 - BUG-21（`_get_brace_content` 的 rfind 边界）、BUG-22（Lua 长字符串 `[[...]]`）、BUG-23（重复值误报，属设计取舍）、BUG-24（混合键类型的默认键）、BUG-28（未编辑的新建表关闭无提示）、BUG-30（工作区递归无符号链接保护/自然排序）、BUG-31（冻结浮层重建开销）。
