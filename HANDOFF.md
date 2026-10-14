@@ -7,6 +7,21 @@
 
 ---
 
+## ★ 状态更新（2026-10-14，整列选择卡顿修复，最新快照）
+
+> 本节为**最新事实**，与下方快照冲突时以本节为准。
+
+**新增机制（后续修改必须了解）**：
+- **`FastHeaderView`（QHeaderView 子类）**：整列选中时所有 section 走等价自绘 `_paint_section_fast`（颜色取自 Theme，与 QSS 一致）。原因：**Qt 的 `QHeaderView.paintSection` 在选区存在时会对未选中的 section 逐行调用 `model.flags()`**（原生模型同样如此，5 万行约 200ms；本项目 Python flags 每次 20µs → 一次重绘 10 秒级）。主视图与冻结浮层的水平表头均已安装。
+- **`LuaTableModel.flags()` 记忆化**：`_flags_cache`（键 `(逻辑行, 列)`），在 `set_data` / `endInsertRows` / `endRemoveRows` / `_mark_dups_dirty` / `_rebuild_duplicates` 中清理。就地改 `row_type` 后必须经上述路径之一清缓存。
+- **委托 `paint` 禁调 `sm.isRowSelected/isColumnSelected`**：改用视图选区快照 `view._sel_is_row/_sel_is_col/_sel_contains`（`LuaTableView._sel_cache`，paintEvent 前刷新）。Qt 的这两个 API 对跨 N 行的 range 是 O(N) 判定，整列选中时单次 700ms+。
+- **选区枚举辅助**：`selection_rows` / `selection_cells`（返回 `(row,col)` 坐标，不物化 QModelIndex）/ `selection_indexes` / `selection_source_rows`。**禁止再直接调用 `selectedIndexes()`**（整列选区 5 万行时 800ms+）。
+- 复制/粘贴路径：无筛选时跳过逐格 `mapToSource`（恒等映射）。
+
+**实测（5 万行 / 3.9MB）**：整列选中重绘 10.2s → 24ms；整列复制 786ms → 292ms；点击列头选整列 + 重绘 40ms。回归测试 **41/41 通过**。
+
+---
+
 ## ★ 状态更新（2026-10-10，P2/P4/性能批次已完成，最新快照）
 
 > 本节为**最新事实**，与下方 09-24 快照冲突时以本节为准。

@@ -16,13 +16,14 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QItemSelectionModel, QSize
 
 app = QApplication([])
 
 from lua_table_editor import (
     LuaParser, LuaSerializer, LuaTableModel, FilterProxyModel,
     LuaTableStr, LuaTableData, RowEntry, MainWindow,
+    LuaTableView, LuaTableDelegate, FastHeaderView,
 )
 
 # ---------------------------------------------------------------------------
@@ -535,6 +536,132 @@ def test_auto_resize_samples_not_full_scan():
         assert 100 <= size <= 280, f"列 {col} 宽度越界: {size}"
 
 # ---------------------------------------------------------------------------
+# 整列选择性能（Qt 表头逐行选区查询陷阱）
+# ---------------------------------------------------------------------------
+
+def test_selection_helpers_equivalence():
+    """selection_rows/cells/source_rows 与 selectedIndexes 语义一致（含筛选映射）。"""
+    import time
+    from lua_table_editor import (selection_rows, selection_cells,
+                                  selection_source_rows)
+    d = LuaParser.parse('T = {\n    {id=1, v="a"},\n    {id=2, v="b"},\n'
+                        '    {id=3, v="c"},\n}')
+    m = LuaTableModel()
+    m.set_data(d)
+    p = FilterProxyModel()
+    p.setSourceModel(m)
+    view = LuaTableView()
+    view.setModel(p)
+    sm = view.selectionModel()
+    # 块选 (0,1)-(1,2)。注意不能用 Select|Current——那等于 SelectCurrent，
+    # 选的是"当前索引"而非传入索引，会把已有选择清空
+    sm.select(p.index(0, 1), QItemSelectionModel.Select)
+    sm.select(p.index(1, 2), QItemSelectionModel.Select)
+    sm.setCurrentIndex(p.index(1, 2), QItemSelectionModel.Current)
+    rows = selection_rows(sm)
+    assert rows == [0, 1], f"selection_rows 错: {rows}"
+    cells = selection_cells(sm)
+    # 两次 Select 产生两个单格 range，逐 range 枚举即得两格
+    assert cells == [(0, 1), (1, 2)], f"selection_cells 错: {cells}"
+    src = selection_source_rows(view, p)
+    assert src == [0, 1], f"selection_source_rows 错: {src}"
+    # 大选区下必须远快于 selectedIndexes（5 万行整列：~800ms vs ~5ms）
+    big = LuaTableData(table_name='T', field_names=['id'])
+    for i in range(20000):
+        big.rows.append(RowEntry(row_type='data', data={'id': i}))
+    m2 = LuaTableModel()
+    m2.set_data(big)
+    p2 = FilterProxyModel()
+    p2.setSourceModel(m2)
+    v2 = LuaTableView()
+    v2.setModel(p2)
+    sm2 = v2.selectionModel()
+    sm2.select(p2.index(0, 1), QItemSelectionModel.Select | QItemSelectionModel.Columns)
+    t0 = time.perf_counter()
+    r = selection_rows(sm2)
+    t_ours = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    _ = sm2.selectedIndexes()
+    t_qt = time.perf_counter() - t0
+    assert len(r) == 20000
+    assert t_ours < t_qt / 5, f"selection_rows 未显著快于 selectedIndexes: {t_ours:.4f}s vs {t_qt:.4f}s"
+
+def test_column_selection_repaint_fast():
+    """整列选中后的重绘必须快（修复前 5 万行一次 render 约 10 秒，UI 卡死）。"""
+    import time
+    from lua_table_editor import FastHeaderView
+    from PySide6.QtGui import QImage
+    n = 20000
+    d = LuaTableData(table_name='T', field_names=['id', 'name', 'type'])
+    for i in range(n):
+        d.rows.append(RowEntry(row_type='data',
+                               data={'id': i + 1, 'name': f'i{i}', 'type': i % 9}))
+    m = LuaTableModel()
+    m.set_data(d)
+    p = FilterProxyModel()
+    p.setSourceModel(m)
+    view = LuaTableView()
+    view.setModel(p)
+    view.setItemDelegate(LuaTableDelegate())
+    view.setHorizontalHeader(FastHeaderView(Qt.Horizontal, view))
+    view.resize(900, 500)
+    view.show()
+    img = QImage(QSize(900, 500), QImage.Format_ARGB32)
+    sm = view.selectionModel()
+    sm.select(p.index(0, 1), QItemSelectionModel.Select | QItemSelectionModel.Columns)
+    app.processEvents()
+    t0 = time.perf_counter()
+    view.render(img)
+    dt = time.perf_counter() - t0
+    assert dt < 0.5, f"整列选中重绘过慢: {dt*1000:.0f}ms（Qt 表头逐行选区查询未绕过）"
+    view.hide()
+
+def test_header_click_selects_column():
+    """点击列头会选中整列（Qt 内置行为），且走 FastHeaderView 不卡顿。"""
+    import time
+    from PySide6.QtGui import QImage, QMouseEvent
+    from PySide6.QtCore import QEvent, QPoint
+    w = MainWindow()
+    d = LuaParser.parse('T = {\n    {id=1, v="a"},\n    {id=2, v="b"},\n}')
+    tab = w._create_tab(d, 'T.lua')
+    td = w._tabs_data[id(tab)]
+    view, proxy = td['view'], td['proxy']
+    assert isinstance(view.horizontalHeader(), FastHeaderView), "未安装 FastHeaderView"
+    hdr = view.horizontalHeader()
+    x = hdr.sectionViewportPosition(2) + 5
+    for etype in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
+        ev = QMouseEvent(etype, QPoint(x, 5), Qt.LeftButton,
+                         Qt.LeftButton, Qt.NoModifier)
+        app.sendEvent(hdr.viewport(), ev)
+    app.processEvents()
+    ranges = view.selectionModel().selection()
+    assert len(ranges) == 1 and ranges[0].left() == 2 and ranges[0].right() == 2, \
+        f"点击列头未选中整列: {[(r.top(), r.bottom(), r.left(), r.right()) for r in ranges]}"
+    # 选中态下重绘不卡
+    img = QImage(QSize(600, 300), QImage.Format_ARGB32)
+    t0 = time.perf_counter()
+    view.render(img)
+    assert time.perf_counter() - t0 < 0.5, "列头选中后重绘过慢"
+
+def test_flags_cache_invalidation():
+    """flags() 记忆化必须在结构/行类型变化后失效（否则可编辑性判定错乱）。"""
+    d = LuaParser.parse('T = {\n    {id=1},\n\n    {id=2},\n}')
+    m = LuaTableModel()
+    m.set_data(d)
+    assert m._resolve_row(1)[0] == LuaTableModel.ROW_BLANK
+    # 空行不可编辑
+    assert not (m.flags(m.index(1, 1)) & Qt.ItemIsEditable)
+    # 缓存里有这一项
+    assert (1, 1) in m._flags_cache
+    # 就地转成注释行后，缓存必须失效：注释行第 1 列可编辑
+    # （逻辑行 1 对应 data.rows[1]，即那个空行）
+    d.rows[1].row_type = 'comment'
+    d.rows[1].comment_text = '-- x'
+    m._mark_dups_dirty()
+    assert (1, 1) not in m._flags_cache, "行类型变化后 flags 缓存未失效"
+    assert m.flags(m.index(1, 1)) & Qt.ItemIsEditable, "注释行第 1 列应可编辑"
+
+# ---------------------------------------------------------------------------
 # 批次4：主窗口
 # ---------------------------------------------------------------------------
 
@@ -722,6 +849,10 @@ def main():
         test_mark_dirty_deferred_rebuild,
         test_selection_outline_smoke,
         test_auto_resize_samples_not_full_scan,
+        test_selection_helpers_equivalence,
+        test_column_selection_repaint_fast,
+        test_header_click_selects_column,
+        test_flags_cache_invalidation,
     ]
     print("=" * 68)
     print("Lua Table Editor 回归测试")
