@@ -1200,9 +1200,9 @@ class LuaTableModel(QAbstractTableModel):
 
         # ===== 头注释行 =====
         if row_type == self.ROW_HEADER_COMMENT:
-            if col == 1 and role == Qt.DisplayRole:
-                return self._data.header_comments[real_idx]
-            if col == 1 and role == Qt.UserRole:
+            # EditRole 必须一并返回原文：否则双击进入编辑时编辑器拿到
+            # None → 打开空编辑器，点击别处提交即把整行内容清空（原 BUG）
+            if col == 1 and role in (Qt.DisplayRole, Qt.EditRole, Qt.UserRole):
                 return self._data.header_comments[real_idx]
             if role == Qt.DisplayRole:
                 return ''
@@ -1245,9 +1245,9 @@ class LuaTableModel(QAbstractTableModel):
         # 注释行
         if row.row_type == 'comment':
             if col == 1:
-                if role == Qt.DisplayRole:
-                    return row.comment_text
-                if role == Qt.UserRole:  # 全量文本
+                # EditRole 必须一并返回原文：否则双击进入编辑时 QLineEdit 拿到
+                # None → 打开空编辑器，点击别处提交即把备注内容清空（原 BUG）
+                if role in (Qt.DisplayRole, Qt.EditRole, Qt.UserRole):
                     return row.comment_text
             else:
                 # 其他列返回空，合并效果由 delegate 处理
@@ -1325,7 +1325,11 @@ class LuaTableModel(QAbstractTableModel):
                 new_text = str(value)
                 # 强制保持注释形态：保存后该行必须仍以 '--' 开头，
                 # 否则重新加载时解析器不识别为注释，行会被静默丢弃
-                if new_text.strip() and not new_text.lstrip().startswith('--'):
+                if not new_text.strip():
+                    # 清空输入时保留 '-- ' 骨架：空 comment_text 序列化为
+                    # 空行，重新加载会被当普通空行丢弃，整行备注直接消失
+                    new_text = '-- '
+                elif not new_text.lstrip().startswith('--'):
                     new_text = '-- ' + new_text.lstrip()
                 if old_val == new_text:
                     return False
@@ -1845,6 +1849,29 @@ class LuaTableDelegate(QStyledItemDelegate):
             g.setHeight(int(h))
             editor.setGeometry(g)
 
+        # 备注行编辑器同样跨列：与整行显示保持一致，避免长备注挤在
+        # 第 1 数据列的窄框里难以编辑
+        try:
+            model = index.model()
+            if isinstance(model, QSortFilterProxyModel):
+                src = model.sourceModel()
+                src_index = model.mapToSource(index)
+            else:
+                src = model
+                src_index = index
+            if isinstance(src, LuaTableModel) and src_index.column() == 1 \
+                    and (src.is_comment_row(src_index.row())
+                         or src.is_structural_row(src_index.row())):
+                view = option.widget or self.parent()
+                if view is not None and hasattr(view, 'viewport'):
+                    g = editor.geometry()
+                    vp_w = view.viewport().width()
+                    if vp_w > g.left():
+                        g.setWidth(max(g.width(), vp_w - g.left()))
+                        editor.setGeometry(g)
+        except Exception:
+            pass
+
     def eventFilter(self, obj, event):
         # 多行编辑器内：Enter 插入换行（不提交），Ctrl+Enter 才提交
         if isinstance(obj, QPlainTextEdit) and event.type() == QEvent.KeyPress:
@@ -1856,6 +1883,32 @@ class LuaTableDelegate(QStyledItemDelegate):
                     return True
                 return False  # 放行给编辑器，插入换行
         return super().eventFilter(obj, event)
+
+    def _comment_text_span(self, view, src, row: int, anchor_col: int = 1):
+        """备注行跨列文本的起笔 x（锚点列左缘 + 8px 内边距）与像素宽度。
+
+        供非锚点列计算"文本未覆盖区域"：这些列不能画全格背景（Qt 按列
+        从左到右绘制，后画的列背景会盖住锚点列已画的跨列文本），只能
+        在文本右侧补画本格状态色，保证整列选中等高亮不被截断。"""
+        if view is None or not hasattr(view, 'columnViewportPosition'):
+            return 0, 0
+        try:
+            x = view.columnViewportPosition(anchor_col) + 8
+        except Exception:
+            return 0, 0
+        if not isinstance(src, LuaTableModel):
+            return x, 0
+        t_idx = src.index(row, 1)
+        if not t_idx.isValid():
+            return x, 0
+        text = src.data(t_idx, Qt.UserRole)
+        if not isinstance(text, str) or not text:
+            return x, 0
+        # 与锚点列绘制保持同一字体（斜体、字号-1）
+        font = QFont(view.font())
+        font.setItalic(True)
+        font.setPointSize(font.pointSize() - 1)
+        return x, QFontMetrics(font).horizontalAdvance(text)
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex):
         model = index.model()
@@ -1880,8 +1933,27 @@ class LuaTableDelegate(QStyledItemDelegate):
         if src.is_comment_row(row) or is_structural:
             painter.save()
 
+            view = option.widget or self.parent()
+
+            # ---- 备注行整行渲染（不分列、一行完整显示）----
+            # 备注文本不再挤在第 1 数据列内按列宽截断，而是由"锚点列"
+            # （第 1 数据列；若它已被横向滚动移出视口，则退化为当前视图
+            # 第一个可见列）起笔，一直画到视口右缘，一行完整展示。
+            # 注意：Qt 按列从左到右逐格绘制，非锚点列不能再画全格背景
+            # （会把锚点列已画的跨列文本盖掉），只能在文本未覆盖的区域
+            # 补画本格自己的状态色（整列选中等高亮不能断）。
+            anchor_col = 1
+            if view is not None and hasattr(view, 'columnViewportPosition'):
+                try:
+                    if view.columnViewportPosition(1) + view.columnWidth(1) <= 0:
+                        first_vis = view.columnAt(0)
+                        if first_vis > anchor_col:
+                            anchor_col = first_vis
+                except Exception:
+                    pass
+            is_anchor = (col == anchor_col)
+
             # ---- 获取行列高亮信息 ----
-            view = self.parent()
             hl_row = -1
             hl_col = -1
             if view is not None and hasattr(view, '_highlight_row'):
@@ -1898,7 +1970,6 @@ class LuaTableDelegate(QStyledItemDelegate):
             # 跨 N 行的 range 是 O(N) 判定，整列选中 5 万行时单次 700ms+，
             # paint 每格调用会把重绘卡死（曾实测一次重绘 10 秒）。
             sel_row = sel_col = False
-            view = option.widget or self.parent()
             if view is not None and hasattr(view, '_sel_is_row') \
                     and index.isValid():
                 sel_row = view._sel_is_row(index.row())
@@ -1907,21 +1978,47 @@ class LuaTableDelegate(QStyledItemDelegate):
 
             # 背景色：根据行类型区分，叠加选中行/列高亮
             if is_intersect:
-                painter.fillRect(option.rect, QColor(Theme.SEL_CROSS))   # 交叉点：金色强调
+                bg = QColor(Theme.SEL_CROSS)   # 交叉点：金色强调
             elif sel_row:
-                painter.fillRect(option.rect, QColor(Theme.SEL_ROW))   # 整行选中：蓝
+                bg = QColor(Theme.SEL_ROW)   # 整行选中：蓝
             elif sel_col:
-                painter.fillRect(option.rect, QColor(Theme.SEL_COL))   # 整列选中：橙
+                bg = QColor(Theme.SEL_COL)   # 整列选中：橙
             elif is_selected:
-                painter.fillRect(option.rect, QColor(Theme.SELECTION))
+                bg = QColor(Theme.SELECTION)
             elif is_highlighted:
-                painter.fillRect(option.rect, QColor(Theme.ACCENT_SOFT))
+                bg = QColor(Theme.ACCENT_SOFT)
             elif is_structural and src._resolve_row(row)[0] == LuaTableModel.ROW_RETURN:
-                painter.fillRect(option.rect, QColor(Theme.RET_BG))  # return 行淡紫色背景
+                bg = QColor(Theme.RET_BG)  # return 行淡紫色背景
             elif is_structural:
-                painter.fillRect(option.rect, QColor(Theme.HDR_CMT_BG))   # 头注释行浅色背景
+                bg = QColor(Theme.HDR_CMT_BG)   # 头注释行浅色背景
             else:
-                painter.fillRect(option.rect, QColor(Theme.CMT_BG))  # 内联注释行
+                bg = QColor(Theme.CMT_BG)  # 内联注释行
+
+            # 整行矩形：锚点列左缘 → 视口右缘
+            row_rect = QRect(option.rect)
+            if is_anchor:
+                vp_w = view.viewport().width() \
+                    if (view is not None and hasattr(view, 'viewport')) else 0
+                if vp_w > row_rect.left():
+                    row_rect = QRect(row_rect.left(), row_rect.top(),
+                                     max(1, vp_w - row_rect.left()),
+                                     row_rect.height())
+
+            # 背景填充：锚点列画满整行；行号列只画自己；
+            # 其余数据列只在跨列文本未覆盖的区域补画（见上方说明）
+            if is_anchor or col == 0:
+                painter.fillRect(row_rect if is_anchor else option.rect, bg)
+            elif col > 0:
+                span_x, span_w = self._comment_text_span(
+                    view, src, row, anchor_col)
+                x0 = min(max(option.rect.left(), span_x + span_w),
+                         option.rect.right())
+                if x0 < option.rect.right():
+                    painter.fillRect(
+                        QRect(x0, option.rect.top(),
+                              option.rect.right() - x0, option.rect.height()),
+                        bg
+                    )
 
             # 选中/高亮行的行号列左侧标记条
             if col == 0 and (is_selected or is_highlighted):
@@ -1929,9 +2026,12 @@ class LuaTableDelegate(QStyledItemDelegate):
                                     4, option.rect.height())
                 painter.fillRect(marker_rect, QColor(Theme.MARKER))
 
-            # 绘制文本（仅第一列有效数据列）
-            if col == 1:
-                text = src.data(src_index, Qt.UserRole) or ''
+            # 绘制文本（锚点列画整行完整文本，一行显示、不做省略截断）
+            if is_anchor:
+                text = ''
+                t_idx = src.index(row, 1)
+                if t_idx.isValid():
+                    text = src.data(t_idx, Qt.UserRole) or ''
                 # 根据行类型设置文字颜色
                 if is_structural and src._resolve_row(row)[0] == LuaTableModel.ROW_RETURN:
                     painter.setPen(QColor(Theme.RET_TEXT))  # return 紫色
@@ -1944,22 +2044,20 @@ class LuaTableDelegate(QStyledItemDelegate):
                 font.setPointSize(font.pointSize() - 1)
                 painter.setFont(font)
 
-                # 裁剪文本以适应
-                rect = option.rect.adjusted(8, 0, -8, 0)
-                elided = painter.fontMetrics().elidedText(
-                    text, Qt.ElideRight, rect.width()
-                )
-                painter.drawText(rect, Qt.AlignLeft | Qt.AlignVCenter, elided)
+                rect = row_rect.adjusted(8, 0, -8, 0)
+                # 完整显示：不再 elide；超出视口的部分由 drawText 自然裁剪，
+                # 鼠标悬停仍有 ToolTip 可查看全文
+                painter.drawText(rect, Qt.AlignLeft | Qt.AlignVCenter, text)
 
-            # 绘制底部分隔线
+            # 绘制底部分隔线（锚点列画满整行）
             painter.setPen(QColor(Theme.SEP_LINE))
             painter.drawLine(
-                option.rect.bottomLeft(), option.rect.bottomRight()
+                row_rect.bottomLeft() if is_anchor else option.rect.bottomLeft(),
+                row_rect.bottomRight() if is_anchor else option.rect.bottomRight()
             )
 
             # 选区外沿描边
-            self._draw_selection_outline(painter, option, index,
-                                         option.widget or self.parent())
+            self._draw_selection_outline(painter, option, index, view)
 
             painter.restore()
             return
@@ -5261,9 +5359,12 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.Yes:
                 return
 
-        self._reload_tab(td, show_status=True)
+        # force=True：用户已明确确认丢弃未保存修改，重载完成回调里
+        # 不能再因 "加载期间表被修改" 的保护而中止（否则点了"确定"
+        # 刷新也没有任何反应，只能关闭标签页重开才能恢复）
+        self._reload_tab(td, show_status=True, force=True)
 
-    def _reload_tab(self, td, show_status=False, auto=False):
+    def _reload_tab(self, td, show_status=False, auto=False, force=False):
         """后台重新解析某标签页对应的磁盘文件并更新模型（单页独立，不阻塞其他页）。"""
         data = td.get('data')
         fp = data.file_path if data else td.get('file_path')
@@ -5271,8 +5372,9 @@ class MainWindow(QMainWindow):
             return
 
         def on_loaded(new_data, file_path):
-            # 重新校验：若加载期间该表被改成已修改，放弃覆盖以免丢失编辑
-            if data and data.modified:
+            # 重新校验：若加载期间该表被改成已修改，放弃覆盖以免丢失编辑。
+            # force=True（用户主动确认丢弃修改并刷新）时跳过该保护。
+            if not force and data and data.modified:
                 return
             model = td['model']
             new_data.modified = False
